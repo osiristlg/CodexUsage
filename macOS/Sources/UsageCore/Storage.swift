@@ -55,6 +55,9 @@ public enum KeychainStore {
                 kSecUseAuthenticationUI as String: "u_AuthUIF"]
     }
     public static func save(_ key: Data, account: String) throws {
+#if CODEX_USAGE_ADHOC
+        try DevelopmentCredentialStore.save(key, account: account)
+#else
         guard key.count == 32 else { throw UsageError.invalid("Invalid derived key.") }
         let q = query(account, service: service)
         let attributes: [String: Any] = [kSecValueData as String: key,
@@ -72,8 +75,12 @@ public enum KeychainStore {
         } else {
             guard add == errSecSuccess else { throw error(add, operation: "add") }
         }
+#endif
     }
     public static func read(account: String) throws -> Data {
+#if CODEX_USAGE_ADHOC
+        return try DevelopmentCredentialStore.read(account: account)
+#else
         let current = copy(account: account, service: service)
         if current.status == errSecSuccess, let key = current.key { return key }
         guard current.status == errSecItemNotFound else { throw error(current.status, operation: "read") }
@@ -83,6 +90,7 @@ public enum KeychainStore {
         try save(key, account: account)
         try? remove(account: account, service: legacyService)
         return key
+#endif
     }
     private static func copy(account: String, service: String) -> (status: OSStatus, key: Data?) {
         var q = query(account, service: service); q[kSecReturnData as String] = true; q[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -93,8 +101,12 @@ public enum KeychainStore {
         return (status, key)
     }
     public static func remove(account: String) throws {
+#if CODEX_USAGE_ADHOC
+        try DevelopmentCredentialStore.remove(account: account)
+#else
         let status = SecItemDelete(query(account, service: service) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw error(status, operation: "remove") }
+#endif
     }
     private static func remove(account: String, service: String) throws {
         let status = SecItemDelete(query(account, service: service) as CFDictionary)
@@ -110,3 +122,41 @@ public enum KeychainStore {
         return .invalid("Keychain \(operation): " + ((SecCopyErrorMessageString(status, nil) as String?) ?? "credential unavailable"))
     }
 }
+
+#if CODEX_USAGE_ADHOC
+private enum DevelopmentCredentialStore {
+    private static var url: URL {
+        if let path = ProcessInfo.processInfo.environment["CODEX_USAGE_CREDENTIALS"] { return URL(fileURLWithPath: path) }
+        return LocalStore.folder.appendingPathComponent("mac-network-credentials.json")
+    }
+
+    static func save(_ key: Data, account: String) throws {
+        guard key.count == 32 else { throw UsageError.invalid("Invalid derived key.") }
+        var values = load()
+        values[account] = key.base64EncodedString()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try JSONEncoder().encode(values).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    static func read(account: String) throws -> Data {
+        guard let encoded = load()[account], let key = Data(base64Encoded: encoded), key.count == 32 else {
+            throw UsageError.invalid("Network credential is not configured. Re-enter the receiver shared passphrase in Settings; no Keychain password is required.")
+        }
+        return key
+    }
+
+    static func remove(account: String) throws {
+        var values = load(); values.removeValue(forKey: account)
+        if values.isEmpty { try? FileManager.default.removeItem(at: url); return }
+        try JSONEncoder().encode(values).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private static func load() -> [String: String] {
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+    }
+}
+#endif

@@ -1,8 +1,9 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-swift build --disable-sandbox -c release --product CodexUsage
-BIN_DIR=$(swift build --disable-sandbox -c release --show-bin-path)
+SWIFT_ADHOC_FLAGS="-Xswiftc -D -Xswiftc CODEX_USAGE_ADHOC"
+swift build --disable-sandbox -c release --product CodexUsage $SWIFT_ADHOC_FLAGS
+BIN_DIR=$(swift build --disable-sandbox -c release --show-bin-path $SWIFT_ADHOC_FLAGS)
 APP="dist/Codex Usage.app"
 mkdir -p "$APP/Contents/MacOS"
 cp "$BIN_DIR/CodexUsage" "$APP/Contents/MacOS/CodexUsage"

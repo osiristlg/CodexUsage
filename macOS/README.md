@@ -40,7 +40,7 @@ Reporting starts disabled. In **Settings → Network**:
 
 Pairing derives the key locally, verifies an encrypted query, and stores only the derived 32-byte key in macOS Keychain. Keychain entries are scoped to the receiver and client ID and are device-local. The passphrase is cleared from the form and never persisted or transmitted. Anonymous project IDs are the default; **Project names** is an explicit opt-in. No project breakdown merges rows into `All projects`.
 
-Local development bundles are ad-hoc signed, so rebuilding changes the app's Keychain identity. Keychain reads are noninteractive and cached for the running app. An accessible credential from the earlier service migrates automatically; if macOS will not release it to the rebuilt app, Settings asks for the receiver shared passphrase once and safely recreates the derived-key item under the stable service. The app never asks for or changes the Mac login Keychain password.
+Signed distribution builds keep the derived network key in macOS Keychain. Local `build-app.sh` bundles are ad-hoc signed, which gives every rebuild a new Keychain identity. To prevent macOS login-Keychain prompts during development, those bundles store only the derived 32-byte network key in `~/Library/Application Support/Codex Usage/mac-network-credentials.json`, restricted to the current user with mode `0600`. The receiver passphrase is still cleared from the form and is never persisted. Rebuilding an ad-hoc app preserves this development credential without asking for the Mac login password.
 
 ### Hosting the receiver on a Mac
 

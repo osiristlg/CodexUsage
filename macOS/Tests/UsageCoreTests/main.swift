@@ -31,5 +31,5 @@ if CommandLine.arguments.contains("--keychain") {
     expectEqual(try KeychainStore.read(account: account), Data(repeating: 43, count: 32))
     try KeychainStore.remove(account: account)
     expectThrows(try KeychainStore.read(account: account))
-    print("PASS: temporary Keychain credential create, update, read and delete")
+    print("PASS: temporary network credential create, update, read and delete")
 }
