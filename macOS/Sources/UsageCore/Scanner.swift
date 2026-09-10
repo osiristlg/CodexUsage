@@ -114,22 +114,29 @@ public enum LogScanner {
         }
     }
     public static func aggregate(_ points: [UsagePoint], start: Date, end: Date, privacy: ProjectPrivacy = .names, key: Data = Data()) -> [AggregateRow] {
-        struct Bucket: Hashable { let time: String; let model: String; let project: String }
+        struct Bucket: Hashable { let time: String; let model: String; let project: String; let projectId: String? }
+        func anonymousProject(_ project: String) -> String {
+            let digest = HMAC<SHA256>.authenticationCode(for: Data(project.utf8), using: SymmetricKey(data: key))
+            return "Project " + digest.prefix(4).map { String(format: "%02X", $0) }.joined()
+        }
         var buckets: [Bucket: Tokens] = [:]
         for p in points where p.time >= start && p.time < end {
             let hour = Date(timeIntervalSince1970: floor(p.time.timeIntervalSince1970 / 3600) * 3600)
             let name: String
+            let projectId: String?
             switch privacy {
-            case .names: name = p.project
-            case .none: name = "All projects"
+            case .names:
+                name = p.project; projectId = anonymousProject(p.project)
+            case .none:
+                name = "All projects"; projectId = nil
             case .anonymous:
-                let digest = HMAC<SHA256>.authenticationCode(for: Data(p.project.utf8), using: SymmetricKey(data: key))
-                name = "Project " + digest.prefix(4).map { String(format: "%02X", $0) }.joined()
+                name = anonymousProject(p.project); projectId = name
             }
-            let bucket = Bucket(time: WireTime.string(hour), model: p.model, project: name)
+            let bucket = Bucket(time: WireTime.string(hour), model: p.model, project: name, projectId: projectId)
             buckets[bucket] = (buckets[bucket] ?? Tokens()) + p.tokens
         }
-        return buckets.map { AggregateRow(bucketStartUtc: $0.key.time, model: $0.key.model, project: $0.key.project, tokens: $0.value) }
+        return buckets.map { AggregateRow(bucketStartUtc: $0.key.time, model: $0.key.model, project: $0.key.project,
+                                          tokens: $0.value, projectId: $0.key.projectId) }
             .sorted { ($0.bucketStartUtc, $0.project, $0.model) < ($1.bucketStartUtc, $1.project, $1.model) }
     }
 }

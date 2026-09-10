@@ -7,7 +7,7 @@ Each client scans its own Codex session logs and sends only derived hourly rows 
 - UTC hour
 - model label
 - input, cached-input, output, reasoning, and response counts
-- either an anonymous project ID, no project breakdown, or a project name when explicitly selected
+- an optional stable anonymous `projectId`; anonymous mode also uses it as `project`, names mode keeps the real name in `project`, and no-project mode omits it
 - the user-configured machine name
 
 Prompts, responses, raw log records, filenames, session IDs, repository paths, and file contents are never added to the payload. The receiver exposes only pairing-salt, health, and encrypted aggregate-exchange endpoints.

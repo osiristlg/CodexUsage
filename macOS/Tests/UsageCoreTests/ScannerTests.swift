@@ -21,10 +21,15 @@ struct ScannerTests {
         let key = Data(repeating: 1, count: 32)
         let rows = LogScanner.aggregate(result.points, start: start, end: end, privacy: .anonymous, key: key)
         expectEqual(rows[0].bucketStartUtc, "2026-09-10T12:00:00Z")
-        expectEqual(rows[0].project.hasPrefix("Project "), true)
+        expectEqual(rows[0].project, "Project 32F458A8")
+        expectEqual(rows[0].projectId, rows[0].project)
         let encoded = String(decoding: try JSONEncoder().encode(rows), as: UTF8.self)
         expectEqual(encoded.contains("Example"), false); expectEqual(encoded.contains("secret"), false)
-        expectEqual(LogScanner.aggregate(result.points + result.points, start: start, end: end, privacy: .none)[0].tokens.total, 240)
+        let named = LogScanner.aggregate(result.points, start: start, end: end, privacy: .names, key: key)
+        expectEqual(named[0].project, "Example"); expectEqual(named[0].projectId, rows[0].project)
+        let ungrouped = LogScanner.aggregate(result.points + result.points, start: start, end: end, privacy: .none)
+        expectEqual(ungrouped[0].tokens.total, 240); expectEqual(ungrouped[0].projectId, nil)
+        expectEqual(String(decoding: try JSONEncoder().encode(ungrouped), as: UTF8.self).contains("projectId"), false)
         var cal = Calendar(identifier: .gregorian); cal.timeZone = TimeZone(identifier: "America/New_York")!
         let before = WireTime.date("2026-09-10T05:59:00Z")!
         expectEqual(SyncWindow.make(now: before, lastFull: nil, force: false, calendar: cal).full, false)

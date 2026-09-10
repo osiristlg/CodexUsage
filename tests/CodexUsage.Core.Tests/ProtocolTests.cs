@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 using CodexUsage.Core;
 using Xunit;
 
@@ -54,6 +55,22 @@ public sealed class ProtocolTests
         Assert.Equal("EBESExQVFhcYGRob", envelope.Nonce);
         Assert.Equal(VectorCiphertext, envelope.Ciphertext);
         Assert.Equal(VectorTag, envelope.Tag);
+    }
+
+    [Fact]
+    public void ProjectIdIsOptionalAndBackwardCompatible()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        const string legacyJson = """
+            {"bucketStartUtc":"2026-09-10T12:00:00Z","model":"Model","project":"Project","tokens":{"input":1,"cachedInput":0,"output":2,"reasoning":0,"responses":1}}
+            """;
+        var legacy = JsonSerializer.Deserialize<AggregateRow>(legacyJson, options)!;
+        Assert.Null(legacy.ProjectId);
+        Assert.DoesNotContain("projectId", JsonSerializer.Serialize(legacy, options));
+
+        var identified = legacy with { ProjectId = "Project A1B2C3D4" };
+        Assert.Equal("Project A1B2C3D4", JsonSerializer.Deserialize<AggregateRow>(
+            JsonSerializer.Serialize(identified, options), options)!.ProjectId);
     }
 
     private static SyncPayload SamplePayload() => new(

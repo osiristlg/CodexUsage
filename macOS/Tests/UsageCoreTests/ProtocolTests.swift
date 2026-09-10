@@ -11,6 +11,7 @@ struct ProtocolTests {
         let payload = try JSONDecoder().decode(SyncPayload.self, from: plaintext)
         expectEqual(payload.kind, "incremental")
         expectEqual(payload.rows.first?.tokens, Tokens(input: 100, cachedInput: 80, output: 20, reasoning: 5, responses: 1))
+        expectEqual(payload.rows.first?.projectId, nil)
         let sealed = try AggregateProtocol.seal(plaintext, clientId: envelope.clientId, requestId: envelope.requestId,
             createdAtUtc: envelope.createdAtUtc, key: key, nonce: Data(16..<28))
         expectEqual(sealed.ciphertext, envelope.ciphertext)

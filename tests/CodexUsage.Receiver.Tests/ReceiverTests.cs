@@ -83,6 +83,20 @@ public sealed class ReceiverTests
         }
     }
 
+    [Fact]
+    public void OptionalProjectIdIsValidatedWithoutRejectingLegacyRows()
+    {
+        var start = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
+        var legacy = Payload(start, new TokenCounts(1, 0, 2, 0, 1));
+        Assert.Null(PayloadValidation.Validate(legacy, 10));
+
+        var invalid = legacy with
+        {
+            Rows = [legacy.Rows[0] with { ProjectId = "" }]
+        };
+        Assert.Equal("Invalid project identifier.", PayloadValidation.Validate(invalid, 10));
+    }
+
     private static SyncPayload Payload(DateTime start, TokenCounts counts) => new(
         "incremental", "Machine A", start, start.AddHours(1), start, start.AddHours(1),
         [new AggregateRow(start, "Model", "Project", counts)]);

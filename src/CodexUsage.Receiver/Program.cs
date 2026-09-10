@@ -224,7 +224,7 @@ internal static class PayloadValidation
                 row.BucketStartUtc < payload.RangeStartUtc || row.BucketStartUtc >= payload.RangeEndUtc)
                 return "An aggregate bucket is outside the declared range or not hour-aligned.";
             if (row.Model.Length is < 1 or > 100 || row.Project.Length is < 1 or > 200) return "Invalid aggregate label.";
-            if (row.ProjectId is { Length: > 80 }) return "Invalid project identifier.";
+            if (row.ProjectId is { Length: < 1 or > 80 }) return "Invalid project identifier.";
             if (row.Tokens.Input < 0 || row.Tokens.CachedInput < 0 || row.Tokens.Output < 0 || row.Tokens.Reasoning < 0 || row.Tokens.Responses < 0)
                 return "Negative aggregate value.";
         }
