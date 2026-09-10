@@ -11,7 +11,9 @@ import UsageCore
     @Published var networkStatus = "Reporting disabled"
     @Published var lastRefresh: Date?
     @Published var selectedDate: Date? = nil
-    @Published var selectedHour: Int? = nil
+    @Published var hoveredDate: Date? = nil
+    @Published var hoveredHour: Int? = nil
+    @Published var filesScanned = 0
     private var lastSnapshot: Date?
     private var snapshotError: String?
     var selectedDay: Date { Calendar.current.startOfDay(for: selectedDate ?? Date()) }
@@ -26,6 +28,10 @@ import UsageCore
         return network.combined
     }
     init() {
+        if !DashboardTheme.all.contains(where: { $0.id == settings.appearance }) {
+            settings.appearance = DashboardTheme.all[0].id
+            try? LocalStore.save(settings, name: "mac-settings.json")
+        }
         if LocalStore.load("mac-settings.json", as: UsageCore.Settings.self) == nil {
             do { try LocalStore.save(settings, name: "mac-settings.json") }
             catch { status = "Could not save initial settings: \(error.localizedDescription)" }
@@ -64,6 +70,7 @@ import UsageCore
                 throw UsageError.invalid("\(scan.unreadableFiles) log files could not be read. Keeping previous totals; sync will retry.")
             }
             points = scan.points
+            filesScanned = scan.files
             try LocalStore.save(points, name: "mac-history.json")
             lastRefresh = now
             status = "\(scan.files) sessions · \(scan.points.count) responses"
@@ -122,7 +129,7 @@ import UsageCore
             guard !settings.snapshotFolder.isEmpty else { throw UsageError.invalid("Choose a snapshot folder in Settings.") }
             let view = SnapshotView(points: points, total: todayTokens, hideProjects: settings.hideSnapshotProjects)
                 .frame(width: 1100).padding(32).background(Color(nsColor: .windowBackgroundColor))
-                .environment(\.colorScheme, settings.appearance == "dark" ? .dark : .light)
+                .environment(\.colorScheme, .dark)
             let renderer = ImageRenderer(content: view); renderer.scale = 2
             guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
                   let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) else {

@@ -1,5 +1,6 @@
 import Foundation
 import UsageCore
+import UsagePresentation
 
 struct ScannerTests {
     func run() throws {
@@ -42,7 +43,31 @@ struct ScannerTests {
         let firstBucket = Date(timeIntervalSince1970: floor(indiaWindow.start.timeIntervalSince1970 / 3600) * 3600)
         expectEqual(firstBucket < indiaWindow.start, true)
         expectThrows(try NetworkClient.endpoint("http://user:pass@host/", path: "api"))
+
+        let nextDay = start.addingTimeInterval(86_400)
+        let fixturePoints = [
+            FixturePoint(time: start.addingTimeInterval(9 * 3_600), model: "A", project: "One", tokens: Tokens(input: 10)),
+            FixturePoint(time: start.addingTimeInterval(9 * 3_600 + 10), model: "B", project: "Two", tokens: Tokens(input: 20)),
+            FixturePoint(time: nextDay.addingTimeInterval(10 * 3_600), model: "A", project: "One", tokens: Tokens(input: 40))
+        ]
+        let presentationPoints = try JSONDecoder().decode([UsagePoint].self, from: JSONEncoder().encode(fixturePoints))
+        var utc = Calendar(identifier: .gregorian); utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        let hours = DashboardPresentation.hours(presentationPoints, day: start, calendar: utc)
+        expectEqual(hours.reduce(Int64(0)) { $0 + $1.total }, 30)
+        expectEqual(DashboardPresentation.projects(presentationPoints, pinnedDay: start, hoveredDay: nil, hoveredHour: 9, calendar: utc).map(\.name), ["Two", "One"])
+        expectEqual(DashboardPresentation.projects(presentationPoints, pinnedDay: start, hoveredDay: nextDay, hoveredHour: nil, calendar: utc).first?.total, 40)
+        let pin = DashboardPresentation.toggledPin(current: nil, clicked: start, today: nextDay, calendar: utc)
+        expectEqual(pin, start)
+        expectEqual(DashboardPresentation.toggledPin(current: pin, clicked: start, today: nextDay, calendar: utc), nil)
+        expectEqual(DashboardPresentation.toggledPin(current: start, clicked: nextDay, today: nextDay, calendar: utc), nil)
     }
+}
+
+private struct FixturePoint: Codable {
+    let time: Date
+    let model: String
+    let project: String
+    let tokens: Tokens
 }
 actor MockReceiver: ExchangeTransport {
     let key = Data(repeating: 1, count: 32)

@@ -6,10 +6,11 @@ import AppKit
     var body: some Scene {
         Window("Codex Usage", id: "dashboard") {
             DashboardView(model: model)
-                .preferredColorScheme(model.settings.appearance == "system" ? nil : model.settings.appearance == "dark" ? .dark : .light)
+                .environment(\.dashboardTheme, DashboardTheme.resolve(model.settings.appearance))
+                .preferredColorScheme(.dark)
                 .task { await model.run() }
         }
-        .defaultSize(width: 1160, height: 860)
+        .defaultSize(width: 1180, height: 900)
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Refresh") { Task { await model.refresh() } }.keyboardShortcut("r")

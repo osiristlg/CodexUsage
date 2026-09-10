@@ -1,195 +1,380 @@
 import SwiftUI
 import Charts
 import UsageCore
+import UsagePresentation
 
-func count(_ value: Int64) -> String { value.formatted(.number.notation(.compactName)) }
-struct Metric: View {
-    let title: String
-    let value: Int64
+func count(_ value: Int64) -> String {
+    if value >= 1_000_000_000 { return (Double(value) / 1_000_000_000).formatted(.number.precision(.fractionLength(0...2))) + "B" }
+    if value >= 1_000_000 { return (Double(value) / 1_000_000).formatted(.number.precision(.fractionLength(0...2))) + "M" }
+    if value >= 1_000 { return (Double(value) / 1_000).formatted(.number.precision(.fractionLength(0...1))) + "K" }
+    return value.formatted()
+}
+
+private func hourRange(_ hour: Int) -> String {
+    let start = Calendar.current.date(from: DateComponents(hour: hour))?.formatted(date: .omitted, time: .shortened) ?? "\(hour):00"
+    let end = Calendar.current.date(from: DateComponents(hour: (hour + 1) % 24))?.formatted(date: .omitted, time: .shortened) ?? "\(hour + 1):00"
+    return "\(start) – \(end)"
+}
+
+private func shortHour(_ hour: Int) -> String {
+    hour == 0 ? "12a" : hour < 12 ? "\(hour)a" : hour == 12 ? "12p" : "\(hour - 12)p"
+}
+
+private struct NeonButtonStyle: ButtonStyle {
+    @Environment(\.dashboardTheme) private var theme
+    let accent: Color
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(theme.text)
+            .padding(.horizontal, 15).frame(height: 36)
+            .background(theme.panel.opacity(configuration.isPressed ? 0.72 : 1), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent.opacity(configuration.isPressed ? 1 : 0.72), lineWidth: 1))
+            .shadow(color: accent.opacity(configuration.isPressed ? 0.15 : 0.3), radius: configuration.isPressed ? 3 : 7)
+    }
+}
+
+private struct DashboardBackdrop: View {
+    @Environment(\.dashboardTheme) private var theme
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.subheadline).foregroundStyle(.secondary)
-            Text(count(value)).font(.system(size: 28, weight: .semibold, design: .rounded)).monospacedDigit()
-        }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
-            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 14))
-            .help(value.formatted())
+        ZStack {
+            LinearGradient(colors: [theme.background.opacity(0.94), theme.background], startPoint: .topLeading, endPoint: .bottomTrailing)
+            Circle().fill(theme.primary.opacity(0.08)).frame(width: 560).blur(radius: 90).offset(x: -430, y: -330)
+            Circle().fill(theme.secondary.opacity(0.07)).frame(width: 520).blur(radius: 100).offset(x: 460, y: 360)
+            Circle().fill(theme.tertiary.opacity(0.035)).frame(width: 340).blur(radius: 70).offset(x: 400, y: -250)
+        }.ignoresSafeArea()
     }
 }
-struct DailyValue: Identifiable {
-    var id: Date { day }
-    let day: Date
-    let total: Int64
-}
-func dailyValues(_ points: [UsagePoint]) -> [DailyValue] {
-    let cal = Calendar.current
-    let grouped = Dictionary(grouping: points) { cal.startOfDay(for: $0.time) }
-    return (-29...0).map {
-        let day = cal.date(byAdding: .day, value: $0, to: cal.startOfDay(for: Date()))!
-        return DailyValue(day: day, total: (grouped[day] ?? []).reduce(0) { $0 + $1.tokens.total })
-    }
-}
-struct HourValue: Identifiable {
-    var id: String { "\(hour)-\(model)" }
-    let hour: Int
-    let model: String
-    let total: Int64
-}
-func hourValues(_ points: [UsagePoint]) -> [HourValue] {
-    var values: [String: HourValue] = [:]
-    for p in points {
-        let h = Calendar.current.component(.hour, from: p.time)
-        let id = "\(h)-\(p.model)"
-        values[id] = HourValue(hour: h, model: p.model, total: (values[id]?.total ?? 0) + p.tokens.total)
-    }
-    return values.values.sorted { ($0.hour, $0.model) < ($1.hour, $1.model) }
-}
+
 struct DashboardView: View {
     @ObservedObject var model: DashboardModel
+    @Environment(\.dashboardTheme) private var theme
     @State private var showSettings = false
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Codex Usage").font(.largeTitle.bold())
-                        Text("Local activity, clearly counted.").foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if model.busy { ProgressView().controlSize(.small) }
-                    Button("Rebuild 30 days") { Task { await model.refresh(force: true) } }.disabled(model.busy)
-                    Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }.help("Settings")
-                }
-                today
-                history
-                HStack {
-                    Text(model.selectedDay.formatted(date: .complete, time: .omitted)).font(.title2.bold())
-                    Spacer()
-                    Text("\(count(model.selectedPoints.reduce(0) { $0 + $1.tokens.total })) tokens").foregroundStyle(.secondary)
-                    Button("Today") { model.selectedDate = nil; model.selectedHour = nil }
-                }
-                HStack(alignment: .top, spacing: 24) {
-                    hourly.frame(maxWidth: .infinity)
-                    projects.frame(width: 290)
-                }
-                Divider()
-                HStack {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(model.status)
-                        Text(model.networkStatus)
-                    }
-                    Spacer()
-                    if let date = model.lastRefresh { Text("Updated \(date.formatted(date: .omitted, time: .standard))") }
-                }.font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            }.padding(28)
-        }.frame(minWidth: 900, minHeight: 720)
-            .sheet(isPresented: $showSettings) { SettingsView(model: model) }
-            .onChange(of: model.selectedDate) { model.selectedHour = nil }
-    }
-    var today: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text("TODAY").font(.caption.bold()).foregroundStyle(.secondary)
-                Text(model.todayTokens.total.formatted()).font(.system(size: 42, weight: .bold, design: .rounded)).monospacedDigit()
-                Text("tokens").foregroundStyle(.secondary)
-                Spacer()
-                if let combined = model.visibleCombined {
-                    VStack(alignment: .trailing) {
-                        Text("All machines · \(count(combined.total))").font(.headline)
-                        Text("Last successful sync").font(.caption).foregroundStyle(.secondary)
-                    }.help(model.network.machines.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value.total.formatted())" }.joined(separator: "\n"))
+        ZStack {
+            DashboardBackdrop()
+            VStack(spacing: 0) {
+                header
+                GeometryReader { geometry in
+                    let margin = max(28.0, geometry.size.width / 35)
+                    let width = max(820, geometry.size.width - margin * 2)
+                    let chartHeight = max(220, (geometry.size.height - 253) / 2)
+                    ScrollView([.vertical, .horizontal]) {
+                        VStack(spacing: 19) {
+                            HeroPanel(model: model).frame(width: width, height: 195)
+                            HStack(spacing: 19) {
+                                HourlyPanel(model: model).frame(width: (width - 19) * 0.66, height: chartHeight)
+                                ProjectPanel(model: model).frame(width: (width - 19) * 0.34, height: chartHeight)
+                            }
+                            HistoryPanel(model: model).frame(width: width, height: chartHeight)
+                        }
+                        .padding(.horizontal, margin).padding(.top, 16).padding(.bottom, 28)
+                    }.scrollIndicators(.never)
                 }
             }
-            HStack(spacing: 12) {
-                Metric(title: "Input", value: model.todayTokens.input)
-                Metric(title: "Cached input", value: model.todayTokens.cachedInput)
-                Metric(title: "Output", value: model.todayTokens.output)
-                Metric(title: "Reasoning", value: model.todayTokens.reasoning)
-            }
-            Text("Total = input + output. Cached input and reasoning are included in those totals.").font(.caption).foregroundStyle(.secondary)
         }
+        .frame(minWidth: 920, minHeight: 700)
+        .sheet(isPresented: $showSettings) { SettingsView(model: model) }
     }
-    var history: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack { Text("30-day history").font(.headline); Spacer(); Text("Select a day to explore").font(.caption).foregroundStyle(.secondary) }
-            Chart(dailyValues(model.points)) { v in
-                BarMark(x: .value("Day", v.day, unit: .day), y: .value("Tokens", v.total))
-                    .foregroundStyle(Calendar.current.isDate(v.day, inSameDayAs: model.selectedDay) ? Color.teal : Color.accentColor.opacity(0.55))
-                    .annotation(position: .overlay) { EmptyView() }
-            }.chartXSelection(value: $model.selectedDate)
-                .chartGesture { proxy in SpatialTapGesture().onEnded { proxy.selectXValue(at: $0.location.x) } }
-                .chartYAxis { AxisMarks { AxisGridLine(); AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.notation(.compactName)) } }
-                .frame(height: 150)
-        }.padding(20).background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 16))
-    }
-    var hourly: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text("Hourly usage by model").font(.headline)
-                Spacer()
-                if let hour = model.selectedHour { Button("Clear \(hour):00") { model.selectedHour = nil }.font(.caption) }
-            }
-            Chart(hourValues(model.selectedPoints)) { v in
-                BarMark(x: .value("Hour", v.hour), y: .value("Tokens", v.total))
-                    .foregroundStyle(by: .value("Model", v.model))
-                if let hour = model.selectedHour, hour == v.hour {
-                    RuleMark(x: .value("Selected hour", hour)).foregroundStyle(.secondary)
-                }
-            }.chartXScale(domain: -1...24).chartXSelection(value: $model.selectedHour)
-                .chartGesture { proxy in SpatialTapGesture().onEnded { proxy.selectXValue(at: $0.location.x) } }
-                .chartYAxis { AxisMarks { AxisGridLine(); AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.notation(.compactName)) } }
-                .chartXAxis { AxisMarks(values: [0, 4, 8, 12, 16, 20, 23]) }.frame(height: 210)
-            if model.selectedPoints.isEmpty { Text("No logged activity for this day.").foregroundStyle(.secondary) }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Text("CODEX  /  USAGE").font(.system(size: 15, weight: .semibold, design: .rounded)).tracking(1.2)
+            Spacer()
+            if model.busy { ProgressView().controlSize(.small).tint(theme.primary) }
+            Text(model.lastRefresh.map { "Updated \($0.formatted(date: .omitted, time: .shortened))  ·  every \(refreshLabel)" } ?? model.status)
+                .font(.system(size: 11)).foregroundStyle(theme.muted).lineLimit(1).frame(maxWidth: 220, alignment: .trailing)
+            Button("↻  Refresh now") { Task { await model.refresh() } }
+                .buttonStyle(NeonButtonStyle(accent: theme.primary)).disabled(model.busy)
+            Button("◷  Rebuild 30 days") { Task { await model.refresh(force: true) } }
+                .buttonStyle(NeonButtonStyle(accent: theme.secondary)).disabled(model.busy)
+            Button { showSettings = true } label: { Image(systemName: "gearshape.fill").frame(width: 17) }
+                .buttonStyle(NeonButtonStyle(accent: theme.tertiary)).help("Settings")
         }
+        .padding(.horizontal, 34).frame(height: 74)
+        .background(theme.background.opacity(0.78)).foregroundStyle(theme.text)
     }
-    var projects: some View {
-        ProjectList(points: model.selectedPoints.filter { model.selectedHour == nil || Calendar.current.component(.hour, from: $0.time) == model.selectedHour }, hideNames: false)
+
+    private var refreshLabel: String {
+        model.settings.refreshSeconds < 60 ? "\(model.settings.refreshSeconds) sec" : "\(model.settings.refreshSeconds / 60) min"
     }
 }
-struct ProjectList: View {
-    let points: [UsagePoint]
-    let hideNames: Bool
-    var entries: [(String, Int64)] {
-        Dictionary(grouping: points, by: \.project).map { ($0.key, $0.value.reduce(0) { $0 + $1.tokens.total }) }
-            .sorted { $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 > $1.1 }
+
+private struct HeroPanel: View {
+    @ObservedObject var model: DashboardModel
+    @Environment(\.dashboardTheme) private var theme
+    var body: some View {
+        GeometryReader { geometry in
+            HStack(alignment: .top, spacing: 28) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("TODAY’S TOKEN USAGE").font(.system(size: 11, weight: .semibold)).tracking(1.1).foregroundStyle(theme.muted)
+                    Text(count(model.todayTokens.total)).font(.system(size: 49, weight: .bold, design: .rounded)).monospacedDigit()
+                        .shadow(color: theme.primary.opacity(0.16), radius: 10)
+                    Spacer()
+                    if let combined = model.visibleCombined, let synced = model.network.lastSuccess {
+                        Text("ALL MACHINES  \(count(combined.total))  ·  synced \(synced.formatted(date: .omitted, time: .shortened))")
+                            .font(.system(size: 11, weight: .semibold)).tracking(0.7).foregroundStyle(theme.tertiary)
+                            .help(model.network.machines.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value.total.formatted())" }.joined(separator: "\n"))
+                    }
+                    Text("\(model.points.filter { Calendar.current.isDateInToday($0.time) }.count.formatted()) responses across \(model.filesScanned.formatted()) log files")
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(theme.muted).lineLimit(1)
+                }
+                .frame(width: max(270, geometry.size.width * 0.27), alignment: .leading)
+                HStack(spacing: 0) {
+                    HeroMetric(title: "INPUT", value: model.todayTokens.input, color: theme.series[0])
+                    HeroMetric(title: "CACHED", value: model.todayTokens.cachedInput, color: theme.series[1])
+                    HeroMetric(title: "OUTPUT", value: model.todayTokens.output, color: theme.series[2])
+                    HeroMetric(title: "REASONING", value: model.todayTokens.reasoning, color: theme.series[3])
+                }.padding(.top, 32)
+            }.padding(.horizontal, 28).padding(.vertical, 24)
+        }
+        .foregroundStyle(theme.text).neonPanel(theme.secondary)
     }
+}
+
+private struct HeroMetric: View {
+    @Environment(\.dashboardTheme) private var theme
+    let title: String
+    let value: Int64
+    let color: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Circle().fill(color).frame(width: 8, height: 8).shadow(color: color.opacity(0.8), radius: 5)
+                Text(title).font(.system(size: 11, weight: .semibold)).tracking(0.8).foregroundStyle(theme.muted)
+            }
+            Text(count(value)).font(.system(size: 25, weight: .semibold, design: .rounded)).monospacedDigit().help(value.formatted())
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct HourlyPanel: View {
+    @ObservedObject var model: DashboardModel
+    @Environment(\.dashboardTheme) private var theme
+    private var day: Date { model.selectedDate ?? Date() }
+    private var values: [HourValue] { DashboardPresentation.hours(model.points, day: day) }
+    private var models: [String] {
+        Dictionary(grouping: values, by: \.model).map { ($0.key, $0.value.reduce(0) { $0 + $1.total }) }
+            .sorted { $0.1 > $1.1 }.map(\.0)
+    }
+    private var totals: [Int64] { (0..<24).map { hour in values.filter { $0.hour == hour }.reduce(0) { $0 + $1.total } } }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Usage by project").font(.headline)
-            if entries.isEmpty { Text("No activity").foregroundStyle(.secondary) }
-            ForEach(Array(entries.prefix(10).enumerated()), id: \.offset) { i, item in
-                VStack(spacing: 5) {
-                    HStack {
-                        Text(hideNames ? "Project \(i + 1)" : item.0).lineLimit(1)
-                        Spacer(); Text(count(item.1)).monospacedDigit().foregroundStyle(.secondary)
-                    }.font(.caption).help(hideNames ? item.1.formatted() : "\(item.0): \(item.1.formatted())")
-                    GeometryReader { geometry in
-                        Capsule().fill(Color.teal.opacity(0.15))
-                        Capsule().fill(Color.teal).frame(width: geometry.size.width * Double(item.1) / Double(max(1, entries.first?.1 ?? 1)))
-                    }.frame(height: 5)
-                }
+            HStack(alignment: .firstTextBaseline) {
+                Text(Calendar.current.isDateInToday(day) ? "Usage through the day" : "Usage through \(day.formatted(.dateTime.month(.abbreviated).day()))")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                HStack(spacing: 14) {
+                    ForEach(Array(models.enumerated()), id: \.element) { index, name in
+                        HStack(spacing: 5) { Circle().fill(theme.series[index % theme.series.count]).frame(width: 7, height: 7); Text(name) }
+                    }
+                }.font(.system(size: 10)).foregroundStyle(theme.muted)
             }
-            if entries.count > 10 { Text("\(entries.count - 10) more projects · \(count(entries.dropFirst(10).reduce(0) { $0 + $1.1 })) tokens").font(.caption).foregroundStyle(.secondary) }
+            HourlyChart(model: model, values: values, models: models, totals: totals)
         }
+        .padding(24).foregroundStyle(theme.text).neonPanel(theme.primary)
     }
 }
+
+private struct HourlyChart: View {
+    @ObservedObject var model: DashboardModel
+    @Environment(\.dashboardTheme) private var theme
+    let values: [HourValue]
+    let models: [String]
+    let totals: [Int64]
+
+    var body: some View {
+        Chart {
+            ForEach(values) { value in
+                BarMark(x: .value("Hour", value.hour), y: .value("Tokens", value.total), stacking: .standard)
+                    .foregroundStyle(color(for: value.model).gradient).cornerRadius(1)
+            }
+            if let hour = model.hoveredHour {
+                RectangleMark(xStart: .value("Start", Double(hour) - 0.48), xEnd: .value("End", Double(hour) + 0.48),
+                              yStart: .value("Bottom", Int64(0)), yEnd: .value("Top", max(Int64(1), totals.max() ?? 1)))
+                    .foregroundStyle(theme.tertiary.opacity(0.08))
+                RuleMark(x: .value("Hovered", hour)).foregroundStyle(theme.tertiary.opacity(0.8)).lineStyle(.init(lineWidth: 1))
+                PointMark(x: .value("Hovered hour", hour), y: .value("Hovered total", totals[hour])).symbolSize(0)
+                    .annotation(position: .top, spacing: 8, overflowResolution: .init(x: .fit, y: .disabled)) {
+                        TooltipBox(accent: theme.tertiary) {
+                            Text(hourRange(hour)).foregroundStyle(theme.muted)
+                            Text("\(totals[hour].formatted()) tokens").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
+                        }
+                    }
+            }
+        }
+        .chartXScale(domain: -0.5...23.5)
+        .chartXAxis { AxisMarks(values: [0, 4, 8, 12, 16, 20, 23]) { value in AxisValueLabel { if let hour = value.as(Int.self) { Text(shortHour(hour)) } }; AxisTick().foregroundStyle(.clear) } }
+        .chartYAxis { AxisMarks(position: .leading, values: .automatic(desiredCount: 5)) { value in AxisGridLine().foregroundStyle(theme.muted.opacity(0.2)); AxisValueLabel { if let amount = value.as(Int64.self) { Text(count(amount)) } else if let amount = value.as(Double.self) { Text(count(Int64(amount))) } } } }
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                Color.clear.contentShape(Rectangle()).onContinuousHover { phase in
+                    switch phase {
+                    case .active(let location):
+                        guard let anchor = proxy.plotFrame else { model.hoveredHour = nil; return }
+                        let plot = geometry[anchor]
+                        guard plot.contains(location), let x: Double = proxy.value(atX: location.x - plot.minX) else { model.hoveredHour = nil; return }
+                        model.hoveredHour = min(23, max(0, Int(floor(x + 0.5)))); model.hoveredDate = nil
+                    case .ended: model.hoveredHour = nil
+                    }
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: model.hoveredHour)
+    }
+
+    private func color(for name: String) -> Color {
+        theme.series[(models.firstIndex(of: name) ?? 0) % theme.series.count]
+    }
+}
+
+private struct ProjectPanel: View {
+    @ObservedObject var model: DashboardModel
+    @Environment(\.dashboardTheme) private var theme
+    private var values: [ProjectValue] {
+        DashboardPresentation.projects(model.points, pinnedDay: model.selectedDate, hoveredDay: model.hoveredDate, hoveredHour: model.hoveredHour)
+    }
+    private var effectiveDay: Date { model.hoveredDate ?? model.selectedDate ?? Date() }
+    private var scope: String {
+        if let hour = model.hoveredHour { return "\(effectiveDay.formatted(.dateTime.month(.abbreviated).day())) · \(hourRange(hour))".uppercased() }
+        return Calendar.current.isDateInToday(effectiveDay) ? "TODAY" : effectiveDay.formatted(.dateTime.month(.abbreviated).day()).uppercased()
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Usage by project").font(.system(size: 15, weight: .semibold))
+                Spacer(); Text(scope).font(.system(size: 9, weight: .semibold)).tracking(0.5).foregroundStyle(theme.tertiary)
+            }
+            if values.isEmpty {
+                Spacer(); Text("No project usage for this selection").font(.system(size: 12)).foregroundStyle(theme.muted).frame(maxWidth: .infinity); Spacer()
+            } else {
+                VStack(spacing: 12) {
+                    ForEach(Array(values.enumerated()), id: \.element.id) { index, value in
+                        VStack(spacing: 7) {
+                            HStack { Text(value.name).lineLimit(1); Spacer(); Text(count(value.total)).foregroundStyle(theme.muted).monospacedDigit() }
+                                .font(.system(size: 11, weight: .semibold)).help("\(value.name): \(value.total.formatted())")
+                            GeometryReader { geometry in
+                                Capsule().fill(theme.muted.opacity(0.16))
+                                Capsule().fill(theme.series[index % theme.series.count])
+                                    .frame(width: geometry.size.width * Double(value.total) / Double(max(1, values.first?.total ?? 1)))
+                                    .shadow(color: theme.series[index % theme.series.count].opacity(0.55), radius: 5)
+                            }.frame(height: 7)
+                        }
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+        }.padding(24).foregroundStyle(theme.text).neonPanel(theme.tertiary)
+    }
+}
+
+private struct HistoryPanel: View {
+    @ObservedObject var model: DashboardModel
+    @Environment(\.dashboardTheme) private var theme
+    private var days: [DailyValue] { DashboardPresentation.days(model.points) }
+    private var hovered: DailyValue? { model.hoveredDate.flatMap { date in days.first { Calendar.current.isDate($0.day, inSameDayAs: date) } } }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Rolling 30-day usage").font(.system(size: 15, weight: .semibold))
+                Spacer()
+                if let date = model.lastRefresh { Text("Built \(date.formatted(.dateTime.month(.abbreviated).day().hour().minute()))") }
+            }.foregroundStyle(theme.text)
+            Chart {
+                ForEach(days) { day in
+                    AreaMark(x: .value("Day", day.day), y: .value("Tokens", day.total))
+                        .foregroundStyle(LinearGradient(colors: [theme.primary.opacity(0.34), theme.secondary.opacity(0.015)], startPoint: .top, endPoint: .bottom))
+                    LineMark(x: .value("Day", day.day), y: .value("Tokens", day.total))
+                        .lineStyle(.init(lineWidth: 2.8, lineCap: .round, lineJoin: .round))
+                        .foregroundStyle(theme.secondary)
+                        .shadow(color: theme.primary.opacity(0.55), radius: 7)
+                    PointMark(x: .value("Day", day.day), y: .value("Tokens", day.total)).symbolSize(26).foregroundStyle(theme.secondary)
+                }
+                if let selected = model.selectedDate, let day = days.first(where: { Calendar.current.isDate($0.day, inSameDayAs: selected) }) {
+                    PointMark(x: .value("Pinned", day.day), y: .value("Tokens", day.total)).symbolSize(150)
+                        .foregroundStyle(theme.tertiary)
+                    PointMark(x: .value("Pinned center", day.day), y: .value("Tokens", day.total)).symbolSize(65)
+                        .foregroundStyle(theme.background)
+                }
+                if let day = hovered {
+                    RuleMark(x: .value("Hovered", day.day)).foregroundStyle(theme.tertiary.opacity(0.65))
+                    PointMark(x: .value("Hover", day.day), y: .value("Tokens", day.total)).symbolSize(105).foregroundStyle(theme.secondary)
+                        .annotation(position: .top, spacing: 10, overflowResolution: .init(x: .fit, y: .fit)) {
+                            TooltipBox(accent: theme.tertiary) {
+                                Text(day.day.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())).foregroundStyle(theme.muted)
+                                Text("\(day.total.formatted()) tokens").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
+                                ForEach(day.models.sorted(by: { $0.value > $1.value }), id: \.key) { name, value in
+                                    HStack(spacing: 6) { Circle().fill(theme.series[max(0, day.models.keys.sorted().firstIndex(of: name) ?? 0) % theme.series.count]).frame(width: 6, height: 6); Text(name).lineLimit(1); Spacer(); Text(count(value)).foregroundStyle(theme.text) }
+                                        .font(.system(size: 10)).foregroundStyle(theme.muted)
+                                }
+                            }.frame(width: 220)
+                        }
+                }
+            }
+            .chartXAxis { AxisMarks(values: days.enumerated().compactMap { [0, 7, 14, 21, 29].contains($0.offset) ? $0.element.day : nil }) { AxisValueLabel(format: .dateTime.month(.abbreviated).day()).foregroundStyle(theme.muted); AxisTick().foregroundStyle(.clear) } }
+            .chartYAxis { AxisMarks(position: .leading, values: .automatic(desiredCount: 5)) { value in AxisGridLine().foregroundStyle(theme.muted.opacity(0.2)); AxisValueLabel { if let amount = value.as(Int64.self) { Text(count(amount)) } else if let amount = value.as(Double.self) { Text(count(Int64(amount))) } }.foregroundStyle(theme.muted) } }
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    Color.clear.contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let location):
+                                guard let plot = proxy.plotFrame.map({ geometry[$0] }), plot.contains(location),
+                                      let value: Date = proxy.value(atX: location.x - plot.minX) else { model.hoveredDate = nil; return }
+                                model.hoveredDate = days.min(by: { abs($0.day.timeIntervalSince(value)) < abs($1.day.timeIntervalSince(value)) })?.day
+                                model.hoveredHour = nil
+                            case .ended: model.hoveredDate = nil
+                            }
+                        }
+                        .gesture(SpatialTapGesture().onEnded { event in
+                            guard let plot = proxy.plotFrame.map({ geometry[$0] }), plot.contains(event.location),
+                                  let value: Date = proxy.value(atX: event.location.x - plot.minX),
+                                  let day = days.min(by: { abs($0.day.timeIntervalSince(value)) < abs($1.day.timeIntervalSince(value)) }) else { return }
+                            model.hoveredDate = day.day
+                            model.hoveredHour = nil
+                            model.selectedDate = DashboardPresentation.toggledPin(current: model.selectedDate, clicked: day.day)
+                        })
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: model.hoveredDate)
+        }.padding(24).foregroundStyle(theme.muted).neonPanel(theme.secondary)
+    }
+}
+
+private struct TooltipBox<Content: View>: View {
+    @Environment(\.dashboardTheme) private var theme
+    let accent: Color
+    @ViewBuilder let content: Content
+    init(accent: Color, @ViewBuilder content: () -> Content) { self.accent = accent; self.content = content() }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) { content }
+            .padding(.horizontal, 10).padding(.vertical, 8)
+            .background(theme.panel, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent.opacity(0.65)))
+            .shadow(color: accent.opacity(0.3), radius: 8)
+    }
+}
+
 struct SnapshotView: View {
     let points: [UsagePoint]
     let total: Tokens
     let hideProjects: Bool
+    private var projects: [ProjectValue] { DashboardPresentation.projects(points, pinnedDay: nil, hoveredDay: nil, hoveredHour: nil) }
     var body: some View {
+        let theme = DashboardTheme.all[0]
         VStack(alignment: .leading, spacing: 22) {
-            Text("Codex Usage · \(Date().formatted(date: .abbreviated, time: .shortened))").font(.title.bold())
-            Text("Today · \(total.total.formatted()) tokens").font(.largeTitle)
-            HStack {
-                Metric(title: "Input", value: total.input); Metric(title: "Cached input", value: total.cachedInput)
-                Metric(title: "Output", value: total.output); Metric(title: "Reasoning", value: total.reasoning)
+            Text("CODEX  /  USAGE").font(.system(size: 16, weight: .semibold)).tracking(1.4)
+            HStack { Text("TODAY’S TOKEN USAGE").foregroundStyle(theme.muted); Text(count(total.total)).font(.system(size: 44, weight: .bold, design: .rounded)); Spacer() }
+            Chart(DashboardPresentation.days(points)) { day in
+                AreaMark(x: .value("Day", day.day), y: .value("Tokens", day.total)).foregroundStyle(theme.primary.opacity(0.2))
+                LineMark(x: .value("Day", day.day), y: .value("Tokens", day.total)).foregroundStyle(theme.primary).lineStyle(.init(lineWidth: 3))
+            }.chartYAxis { AxisMarks { value in AxisGridLine().foregroundStyle(theme.muted.opacity(0.2)); AxisValueLabel { if let amount = value.as(Int64.self) { Text(count(amount)) } else if let amount = value.as(Double.self) { Text(count(Int64(amount))) } } } }.frame(height: 250)
+            Text("Usage by project").font(.headline)
+            ForEach(Array(projects.enumerated()), id: \.element.id) { index, project in
+                HStack { Text(hideProjects && project.name != "Other" ? "Project \(index + 1)" : project.name); Spacer(); Text(count(project.total)) }
             }
-            Chart(dailyValues(points)) { v in
-                BarMark(x: .value("Day", v.day, unit: .day), y: .value("Tokens", v.total)).foregroundStyle(.teal)
-            }.chartYAxis { AxisMarks { AxisGridLine(); AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.notation(.compactName)) } }
-                .frame(height: 200)
-            ProjectList(points: points.filter { Calendar.current.isDateInToday($0.time) }, hideNames: hideProjects)
-        }
+        }.padding(30).foregroundStyle(theme.text).background(theme.background)
     }
 }

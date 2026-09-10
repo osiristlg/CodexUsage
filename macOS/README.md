@@ -16,11 +16,11 @@ The script creates an ad-hoc signed app for local development. Distribution sign
 ## Dashboard
 
 - Today's local total, input, cached input, output and reasoning counts.
-- A rolling 30-day chart; select a day to inspect hourly model usage and project totals.
-- Select an hour to narrow the project breakdown. **Today** clears the historical selection.
+- A neon rolling 30-day line chart with floating date, total, and per-model tooltips. Click a day to pin or unpin its hourly and project views.
+- Hourly stacked model bars have pointer-tracked totals; hovering an hour or history point synchronizes the project breakdown.
 - Automatic refresh at 15 seconds, 30 seconds, one minute or five minutes, while the app is running.
 - **Rebuild 30 days** rescans the logs and queues a full network reconciliation, retained across restart until a successful sync.
-- System, light and dark appearances.
+- The same Night City, Neon Sunset, Toxic Rain, Ion Storm, and Redline District palettes as the Windows dashboard.
 - Optional PNG snapshots every 5, 15, 30 or 60 minutes, with project names hidden by default. Export atomically replaces `codex-usage-latest.png`.
 
 Snapshots are generated on the next refresh after their interval elapses. Refresh and synchronization resume after sleep while the app is open; no launch agent or background service is installed. The app intentionally rescans the local logs on refresh for correctness, including older session files that receive new events. Large log collections may take longer.

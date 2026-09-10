@@ -45,12 +45,14 @@ Passed locally:
 - Debug app build and release app-bundle build/ad-hoc signing.
 - Authorized app launch, real-data dashboard, historical day selection, hourly project filtering, Today reset, native settings and snapshot export.
 - Visual inspection of the exported PNG confirmed anonymous project labels and correctly rendered project bars. Temporary export was disabled after verification.
+- Compared the live Mac dashboard and all four settings pages against eight authoritative Windows PNG references. The Mac UI now matches the Windows three-band geometry, five palettes, neon panel hierarchy, stacked model bars, project tracks, rolling line/area chart, and control-deck settings rail.
+- Verified pointer-tracked hourly and 30-day tooltips, click-to-pin history selection, hover-over-pin project scoping, tooltip clamping, and the local-total/all-machines hierarchy against a live receiver response.
+- Re-paired through the final app bundle after resetting its macOS privacy decision, then confirmed an app-owned Keychain credential, a successful encrypted sync, and a cold restart with unattended Keychain read and follow-up sync.
 
 UI verification exposed and corrected missing click gestures on the charts and native progress indicators that ImageRenderer could not export. Charts now use explicit click selection and compact axis labels; project bars use SwiftUI shapes. Initial settings are persisted immediately to keep the client ID stable before pairing.
 
-Pending manual validation:
+Remaining platform validation:
 
-- Pairing and exchanging with an actual configured .NET receiver; no live receiver endpoint or passphrase was supplied and the local .NET SDK is absent.
 - Distribution signing/notarization and testing on Intel hardware or macOS 14.
 
-The native UI provides the Windows dashboard's core views and snapshot controls, with native light/dark/system styling rather than its custom Windows themes. The receiver and Windows source files remain unchanged.
+The native UI carries the Windows dashboard's exact color palettes, visual hierarchy, hover and pinned-selection behavior into SwiftUI while retaining Mac-native windows, sheets, menus, folder panels, pointer events, and typography. The receiver, scanner, protocol, storage, and Windows sources remain unchanged by the parity campaign.
