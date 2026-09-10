@@ -57,21 +57,23 @@ app.MapGet("/health", () => Results.Ok(new
 {
     service = "Codex Usage Receiver",
     protocolVersion = AggregateProtocol.Version,
-    clients = receiverSettings.Clients.Count(c => c.Enabled)
+    clients = ReceiverSettingsStore.Load(settingsPath).Clients.Count(c => c.Enabled)
 }));
 
 app.MapGet("/api/v1/salt/{clientId}", (string clientId, HttpContext context) =>
 {
-    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, receiverSettings.AllowedSubnets)) return Results.NotFound();
-    var client = receiverSettings.Clients.FirstOrDefault(c => c.Enabled &&
+    var currentSettings = ReceiverSettingsStore.Load(settingsPath);
+    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, currentSettings.AllowedSubnets)) return Results.NotFound();
+    var client = currentSettings.Clients.FirstOrDefault(c => c.Enabled &&
         string.Equals(c.ClientId, clientId, StringComparison.OrdinalIgnoreCase));
     return client is null ? Results.NotFound() : Results.Ok(new { version = AggregateProtocol.Version, salt = client.Salt });
 });
 
 app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext context) =>
 {
-    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, receiverSettings.AllowedSubnets)) return Results.NotFound();
-    var client = receiverSettings.Clients.FirstOrDefault(c => c.Enabled &&
+    var currentSettings = ReceiverSettingsStore.Load(settingsPath);
+    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, currentSettings.AllowedSubnets)) return Results.NotFound();
+    var client = currentSettings.Clients.FirstOrDefault(c => c.Enabled &&
         string.Equals(c.ClientId, envelope.ClientId, StringComparison.OrdinalIgnoreCase));
     if (client is null) return Results.NotFound();
     if (Math.Abs((DateTime.UtcNow - envelope.CreatedAtUtc.ToUniversalTime()).TotalMinutes) > 15)
@@ -87,14 +89,14 @@ app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext c
         catch (Exception ex) when (ex is CryptographicException or JsonException or FormatException)
         { return Results.Unauthorized(); }
 
-        var validation = PayloadValidation.Validate(payload, receiverSettings.MaxRowsPerRequest);
+        var validation = PayloadValidation.Validate(payload, currentSettings.MaxRowsPerRequest);
         if (validation is not null) return Results.BadRequest(new { error = validation });
 
         var result = await UsageDatabase.ReplaceAndSummarizeAsync(databasePath, client.ClientId, payload, envelope.RequestId);
         var namedMachines = new Dictionary<string, TokenCounts>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in result.Machines)
         {
-            var name = receiverSettings.Clients.FirstOrDefault(c =>
+            var name = currentSettings.Clients.FirstOrDefault(c =>
                 string.Equals(c.ClientId, pair.Key, StringComparison.OrdinalIgnoreCase))?.MachineName ?? pair.Key;
             if (namedMachines.ContainsKey(name)) name = $"{name} ({pair.Key[..Math.Min(8, pair.Key.Length)]})";
             namedMachines[name] = pair.Value;
@@ -102,7 +104,7 @@ app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext c
         var namedMachineRows = new Dictionary<string, IReadOnlyList<AggregateRow>>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in result.MachineRows)
         {
-            var name = receiverSettings.Clients.FirstOrDefault(c =>
+            var name = currentSettings.Clients.FirstOrDefault(c =>
                 string.Equals(c.ClientId, pair.Key, StringComparison.OrdinalIgnoreCase))?.MachineName ?? pair.Key;
             if (namedMachineRows.ContainsKey(name)) name = $"{name} ({pair.Key[..Math.Min(8, pair.Key.Length)]})";
             namedMachineRows[name] = pair.Value;

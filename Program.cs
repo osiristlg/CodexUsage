@@ -426,6 +426,61 @@ internal static class SettingsStore
     }
 }
 
+internal sealed record ReceiverClientEntry(string ClientId, string MachineName, string Salt, string Key, bool Enabled);
+internal sealed record ReceiverAdminSettings(
+    string BindAddress,
+    int Port,
+    IReadOnlyList<string> AllowedSubnets,
+    IReadOnlyList<ReceiverClientEntry> Clients,
+    int MaxPayloadBytes = 16 * 1024 * 1024,
+    int MaxRowsPerRequest = 100_000);
+
+internal static class ReceiverClientManager
+{
+    private static readonly string ConfigPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Codex Usage Receiver", "receiver-settings.json");
+    private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
+
+    public static bool IsAvailable => File.Exists(ConfigPath);
+
+    public static IReadOnlyList<ReceiverClientEntry> LoadClients() => Load().Clients;
+
+    public static void Rotate(IReadOnlyCollection<string> clientIds, string passphrase)
+    {
+        if (clientIds.Count == 0) throw new InvalidOperationException("Select at least one receiver client.");
+        if (passphrase.Length < 12) throw new InvalidOperationException("Use a shared passphrase of at least 12 characters.");
+        var selected = clientIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var settings = Load();
+        if (!settings.Clients.Any(client => selected.Contains(client.ClientId)))
+            throw new InvalidOperationException("The selected receiver clients no longer exist.");
+
+        var clients = new List<ReceiverClientEntry>(settings.Clients.Count);
+        foreach (var client in settings.Clients)
+        {
+            if (!selected.Contains(client.ClientId)) { clients.Add(client); continue; }
+            var salt = AggregateProtocol.NewSalt();
+            var key = AggregateProtocol.DeriveKey(passphrase, salt);
+            try
+            {
+                clients.Add(client with { Salt = Convert.ToBase64String(salt), Key = Convert.ToBase64String(key) });
+            }
+            finally { CryptographicOperations.ZeroMemory(key); }
+        }
+        Save(settings with { Clients = clients });
+    }
+
+    private static ReceiverAdminSettings Load() =>
+        JsonSerializer.Deserialize<ReceiverAdminSettings>(File.ReadAllText(ConfigPath))
+        ?? throw new InvalidDataException("Receiver settings are empty.");
+
+    private static void Save(ReceiverAdminSettings settings)
+    {
+        var temporary = ConfigPath + ".tmp";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(settings, Options));
+        File.Move(temporary, ConfigPath, true);
+    }
+}
+
 internal sealed class DashboardForm : Form
 {
     private static ThemePalette Theme => ThemeCatalog.Current;
@@ -1099,8 +1154,20 @@ internal sealed class DashboardForm : Form
             test.Location = new Point(20, 300);
             test.Click += async (_, _) => await TestConnectionAsync(test);
             networkStatus.Location = new Point(166, 310);
-            networkStatus.MaximumSize = new Size(430, 36);
-            card.Controls.AddRange([badge, test, networkStatus]);
+            networkStatus.MaximumSize = new Size(250, 36);
+            var manage = CompactButton("Manage receiver clients", Theme.Tertiary);
+            manage.Size = new Size(176, 40);
+            manage.Location = new Point(432, 300);
+            manage.Enabled = ReceiverClientManager.IsAvailable;
+            manage.Click += (_, _) =>
+            {
+                using var dialog = new ReceiverClientsDialog();
+                dialog.ShowDialog(this);
+                networkStatus.ForeColor = Theme.Muted;
+                networkStatus.Text = "Enter the matching passphrase on each rotated client.";
+            };
+            if (!manage.Enabled) manage.Text = "Receiver not on this PC";
+            card.Controls.AddRange([badge, test, networkStatus, manage]);
             page.Controls.Add(card);
             return page;
         }
@@ -1352,6 +1419,87 @@ internal sealed class DashboardForm : Form
 
         [DllImport("user32.dll")]
         private static extern nint SendMessage(nint hWnd, int message, int wParam, int lParam);
+    }
+
+    private sealed class ReceiverClientsDialog : Form
+    {
+        private readonly CheckedListBox clientList = new() { CheckOnClick = true };
+        private readonly TextBox password = new() { UseSystemPasswordChar = true };
+        private readonly TextBox confirmation = new() { UseSystemPasswordChar = true };
+        private readonly Label feedback = new() { AutoSize = true };
+        private readonly ReceiverClientEntry[] clients;
+
+        public ReceiverClientsDialog()
+        {
+            clients = ReceiverClientManager.LoadClients().ToArray();
+            Text = "Receiver clients";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ClientSize = new Size(620, 430);
+            BackColor = Bg;
+            ForeColor = TextMain;
+            Font = new Font("Segoe UI", 9.5f);
+
+            var title = new Label
+            {
+                Text = "MANAGE RECEIVER CLIENTS", AutoSize = true, Location = new Point(28, 24),
+                Font = new Font("Segoe UI Semibold", 16f, FontStyle.Bold), ForeColor = TextMain
+            };
+            var explanation = new Label
+            {
+                Text = "Select one or more machines, set their new shared passphrase, then enter that same passphrase in each selected app.",
+                Location = new Point(30, 61), Size = new Size(555, 42), ForeColor = TextMuted
+            };
+            clientList.Location = new Point(30, 108);
+            clientList.Size = new Size(560, 116);
+            clientList.BackColor = Panel;
+            clientList.ForeColor = TextMain;
+            clientList.BorderStyle = BorderStyle.FixedSingle;
+            foreach (var client in clients) clientList.Items.Add($"{client.MachineName}   ({client.ClientId})");
+
+            var passwordLabel = new Label { Text = "NEW SHARED PASSPHRASE", AutoSize = true, Location = new Point(30, 246), ForeColor = TextMuted };
+            password.Location = new Point(30, 269); password.Size = new Size(270, 28); password.BackColor = Panel; password.ForeColor = TextMain;
+            var confirmLabel = new Label { Text = "CONFIRM PASSPHRASE", AutoSize = true, Location = new Point(320, 246), ForeColor = TextMuted };
+            confirmation.Location = new Point(320, 269); confirmation.Size = new Size(270, 28); confirmation.BackColor = Panel; confirmation.ForeColor = TextMain;
+            feedback.Location = new Point(31, 310);
+            feedback.MaximumSize = new Size(555, 38);
+            feedback.ForeColor = TextMuted;
+            feedback.Text = "Tick multiple machines to give them the same passphrase in one step.";
+
+            var rotate = MakeButton("Rotate selected clients", 190, Theme.Tertiary);
+            rotate.Location = new Point(400, 360);
+            rotate.Click += (_, _) => RotateSelected();
+            var close = MakeButton("Close", 100, Theme.Muted);
+            close.Location = new Point(290, 360);
+            close.Click += (_, _) => Close();
+            Controls.AddRange([title, explanation, clientList, passwordLabel, password, confirmLabel, confirmation, feedback, close, rotate]);
+        }
+
+        private void RotateSelected()
+        {
+            feedback.ForeColor = Theme.Secondary;
+            if (password.Text != confirmation.Text)
+            {
+                feedback.Text = "The two passphrases do not match.";
+                return;
+            }
+            try
+            {
+                var ids = clientList.CheckedIndices.Cast<int>().Select(index => clients[index].ClientId).ToArray();
+                ReceiverClientManager.Rotate(ids, password.Text);
+                password.Clear();
+                confirmation.Clear();
+                feedback.ForeColor = Theme.Primary;
+                feedback.Text = $"Rotated {ids.Length} client{(ids.Length == 1 ? "" : "s")}. No receiver restart is needed.";
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or
+                                          CryptographicException or InvalidDataException or InvalidOperationException)
+            {
+                feedback.Text = ex.Message;
+            }
+        }
     }
 
     private sealed class PathDisplay : Label
