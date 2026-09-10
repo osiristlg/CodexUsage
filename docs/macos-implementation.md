@@ -43,10 +43,13 @@ Passed locally:
 - Encrypted mocked exchange, retry envelope identity and failed-sync marker behavior.
 - Temporary Keychain create/read/update/delete, with cleanup.
 - Debug app build and release app-bundle build/ad-hoc signing.
+- Authorized app launch, real-data dashboard, historical day selection, hourly project filtering, Today reset, native settings and snapshot export.
+- Visual inspection of the exported PNG confirmed anonymous project labels and correctly rendered project bars. Temporary export was disabled after verification.
+
+UI verification exposed and corrected missing click gestures on the charts and native progress indicators that ImageRenderer could not export. Charts now use explicit click selection and compact axis labels; project bars use SwiftUI shapes. Initial settings are persisted immediately to keep the client ID stable before pairing.
 
 Pending manual validation:
 
-- Launch and visual interaction with the built app, chart selection, settings and PNG rendering. Automatic approval review blocked launching this locally built app pending user confirmation.
 - Pairing and exchanging with an actual configured .NET receiver; no live receiver endpoint or passphrase was supplied and the local .NET SDK is absent.
 - Distribution signing/notarization and testing on Intel hardware or macOS 14.
 

@@ -26,6 +26,10 @@ import UsageCore
         return network.combined
     }
     init() {
+        if LocalStore.load("mac-settings.json", as: UsageCore.Settings.self) == nil {
+            do { try LocalStore.save(settings, name: "mac-settings.json") }
+            catch { status = "Could not save initial settings: \(error.localizedDescription)" }
+        }
         points = LocalStore.load("mac-history.json", as: [UsagePoint].self) ?? []
         network = LocalStore.load("mac-network-state.json", as: NetworkState.self) ?? NetworkState()
         networkStatus = settings.reportingEnabled ? "Waiting for refresh" : "Reporting disabled"

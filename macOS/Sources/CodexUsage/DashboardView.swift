@@ -116,7 +116,10 @@ struct DashboardView: View {
                 BarMark(x: .value("Day", v.day, unit: .day), y: .value("Tokens", v.total))
                     .foregroundStyle(Calendar.current.isDate(v.day, inSameDayAs: model.selectedDay) ? Color.teal : Color.accentColor.opacity(0.55))
                     .annotation(position: .overlay) { EmptyView() }
-            }.chartXSelection(value: $model.selectedDate).frame(height: 150)
+            }.chartXSelection(value: $model.selectedDate)
+                .chartGesture { proxy in SpatialTapGesture().onEnded { proxy.selectXValue(at: $0.location.x) } }
+                .chartYAxis { AxisMarks { AxisGridLine(); AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.notation(.compactName)) } }
+                .frame(height: 150)
         }.padding(20).background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 16))
     }
     var hourly: some View {
@@ -133,6 +136,8 @@ struct DashboardView: View {
                     RuleMark(x: .value("Selected hour", hour)).foregroundStyle(.secondary)
                 }
             }.chartXScale(domain: -1...24).chartXSelection(value: $model.selectedHour)
+                .chartGesture { proxy in SpatialTapGesture().onEnded { proxy.selectXValue(at: $0.location.x) } }
+                .chartYAxis { AxisMarks { AxisGridLine(); AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.notation(.compactName)) } }
                 .chartXAxis { AxisMarks(values: [0, 4, 8, 12, 16, 20, 23]) }.frame(height: 210)
             if model.selectedPoints.isEmpty { Text("No logged activity for this day.").foregroundStyle(.secondary) }
         }
@@ -158,7 +163,10 @@ struct ProjectList: View {
                         Text(hideNames ? "Project \(i + 1)" : item.0).lineLimit(1)
                         Spacer(); Text(count(item.1)).monospacedDigit().foregroundStyle(.secondary)
                     }.font(.caption).help(hideNames ? item.1.formatted() : "\(item.0): \(item.1.formatted())")
-                    ProgressView(value: Double(item.1), total: Double(max(1, entries.first?.1 ?? 1))).tint(.teal)
+                    GeometryReader { geometry in
+                        Capsule().fill(Color.teal.opacity(0.15))
+                        Capsule().fill(Color.teal).frame(width: geometry.size.width * Double(item.1) / Double(max(1, entries.first?.1 ?? 1)))
+                    }.frame(height: 5)
                 }
             }
             if entries.count > 10 { Text("\(entries.count - 10) more projects · \(count(entries.dropFirst(10).reduce(0) { $0 + $1.1 })) tokens").font(.caption).foregroundStyle(.secondary) }
@@ -179,7 +187,8 @@ struct SnapshotView: View {
             }
             Chart(dailyValues(points)) { v in
                 BarMark(x: .value("Day", v.day, unit: .day), y: .value("Tokens", v.total)).foregroundStyle(.teal)
-            }.frame(height: 200)
+            }.chartYAxis { AxisMarks { AxisGridLine(); AxisValueLabel(format: FloatingPointFormatStyle<Double>.number.notation(.compactName)) } }
+                .frame(height: 200)
             ProjectList(points: points.filter { Calendar.current.isDateInToday($0.time) }, hideNames: hideProjects)
         }
     }
