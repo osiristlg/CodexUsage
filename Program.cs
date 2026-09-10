@@ -1,0 +1,1432 @@
+using System.Text.Json;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Globalization;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace CodexUsageDashboard;
+
+internal static class Program
+{
+    [STAThread]
+    private static void Main(string[] args)
+    {
+        if (args.Contains("--diagnose", StringComparer.OrdinalIgnoreCase))
+        {
+            var snapshot = LogScanner.ScanTodayAsync(CancellationToken.None).GetAwaiter().GetResult();
+            var history = LogScanner.ScanHistoryAsync(30, CancellationToken.None).GetAwaiter().GetResult();
+            var report = JsonSerializer.Serialize(new
+            {
+                snapshot.Day,
+                snapshot.RefreshedAt,
+                snapshot.Total,
+                snapshot.Input,
+                snapshot.Cached,
+                snapshot.Output,
+                snapshot.Reasoning,
+                snapshot.FilesScanned,
+                Responses = snapshot.Points.Count,
+                Models = snapshot.Points.GroupBy(p => p.Model).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
+                Projects = snapshot.Points.GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
+                HistoryDays = history.Days.Count,
+                HistoryTotal = history.Days.Sum(d => d.Tokens),
+                HistoryFirstDay = history.Days.FirstOrDefault(),
+                HistoryLastDay = history.Days.LastOrDefault(),
+                CachedHistoryVersion = HistoryStore.Load()?.FormatVersion
+            }, new JsonSerializerOptions { WriteIndented = true });
+            AttachConsole(ATTACH_PARENT_PROCESS);
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+            Console.WriteLine(report);
+            return;
+        }
+        ApplicationConfiguration.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, eventArgs) => MessageBox.Show(
+            $"The dashboard recovered from an error:\n\n{eventArgs.Exception.Message}",
+            "Codex Usage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        Application.Run(new DashboardForm());
+    }
+
+    private const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool AttachConsole(uint processId);
+}
+
+internal sealed record UsagePoint(DateTime Time, string Model, string Project, long Input, long Cached, long Output, long Reasoning)
+{
+    public long Total => Input + Output;
+}
+
+internal sealed record UsageSnapshot(DateTime Day, DateTime RefreshedAt, IReadOnlyList<UsagePoint> Points, int FilesScanned)
+{
+    public long Total => Points.Sum(p => p.Total);
+    public long Input => Points.Sum(p => p.Input);
+    public long Cached => Points.Sum(p => p.Cached);
+    public long Output => Points.Sum(p => p.Output);
+    public long Reasoning => Points.Sum(p => p.Reasoning);
+}
+
+internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects);
+internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
+    IReadOnlyList<HourlyUsage>? Hours = null);
+internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 4);
+
+internal static class LogScanner
+{
+    public static string DefaultSessionsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "sessions");
+
+    public static Task<UsageSnapshot> ScanTodayAsync(CancellationToken token, string? sessionsPath = null) =>
+        Task.Run(() => ScanToday(token, ResolveSessionsPath(sessionsPath)), token);
+
+    public static Task<HistoryCache> ScanHistoryAsync(int days, CancellationToken token, string? sessionsPath = null) => Task.Run(() =>
+    {
+        var sourcePath = ResolveSessionsPath(sessionsPath);
+        var end = DateTime.Today;
+        var start = end.AddDays(-(days - 1));
+        var files = Directory.Exists(sourcePath)
+            ? Directory.EnumerateFiles(sourcePath, "*.jsonl", SearchOption.AllDirectories).ToArray()
+            : [];
+        var points = new List<UsagePoint>();
+        foreach (var file in files)
+        {
+            token.ThrowIfCancellationRequested();
+            ScanFile(file, start, end, points, token);
+        }
+        var byDay = points.GroupBy(p => p.Time.Date).ToDictionary(g => g.Key, g => g.ToArray());
+        var result = Enumerable.Range(0, days).Select(i => start.AddDays(i))
+            .Select(date =>
+            {
+                var dayPoints = byDay.GetValueOrDefault(date) ?? [];
+                var hours = Enumerable.Range(0, 24).Select(hour =>
+                {
+                    var hourPoints = dayPoints.Where(p => p.Time.Hour == hour).ToArray();
+                    return new HourlyUsage(hour, hourPoints.Sum(p => p.Total),
+                        hourPoints.GroupBy(p => p.Model).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
+                        hourPoints.GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
+                }).ToArray();
+                return new DailyUsage(date, dayPoints.Sum(p => p.Total), dayPoints
+                    .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours);
+            }).ToArray();
+        return new HistoryCache(DateTime.Now, result);
+    }, token);
+
+    private static UsageSnapshot ScanToday(CancellationToken token, string sessionsPath)
+    {
+        var today = DateTime.Today;
+        var candidateDays = new[] { today.AddDays(-1), today, today.AddDays(1) };
+        var dateFolderFiles = candidateDays
+            .Select(d => Path.Combine(sessionsPath, d.ToString("yyyy"), d.ToString("MM"), d.ToString("dd")))
+            .Where(Directory.Exists)
+            .SelectMany(d => Directory.EnumerateFiles(d, "*.jsonl", SearchOption.TopDirectoryOnly));
+        var recentlyActiveFiles = Directory.Exists(sessionsPath)
+            ? Directory.EnumerateFiles(sessionsPath, "*.jsonl", SearchOption.AllDirectories)
+                .Where(file => File.GetLastWriteTime(file) >= today.AddDays(-1))
+            : [];
+        var files = dateFolderFiles.Concat(recentlyActiveFiles)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var points = new List<UsagePoint>();
+        foreach (var file in files)
+        {
+            token.ThrowIfCancellationRequested();
+            ScanFile(file, today, today, points, token);
+        }
+        return new UsageSnapshot(today, DateTime.Now, points, files.Length);
+    }
+
+    private static string ResolveSessionsPath(string? sessionsPath) =>
+        string.IsNullOrWhiteSpace(sessionsPath) ? DefaultSessionsPath : Path.GetFullPath(sessionsPath);
+
+    private static void ScanFile(string file, DateTime firstDay, DateTime lastDay, List<UsagePoint> points, CancellationToken token)
+    {
+        var modelByTurn = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string fallbackModel = "Unknown model";
+        string currentModel = fallbackModel;
+        string currentProject = "Projectless";
+        var countPoints = new List<UsagePoint>();
+        var recordPoints = new List<UsagePoint>();
+        try
+        {
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.SequentialScan);
+            using var reader = new StreamReader(stream);
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
+            {
+                token.ThrowIfCancellationRequested();
+                if (!line.Contains("\"turn_context\"", StringComparison.Ordinal) &&
+                    !line.Contains("\"token_count\"", StringComparison.Ordinal) &&
+                    !line.Contains("\"token_usage_record\"", StringComparison.Ordinal) &&
+                    !line.Contains("\"session_meta\"", StringComparison.Ordinal)) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement;
+                    var type = root.GetProperty("type").GetString();
+                    var payload = root.GetProperty("payload");
+
+                    if (type == "session_meta")
+                    {
+                        if (payload.TryGetProperty("cwd", out var cwd))
+                            currentProject = FriendlyProject(cwd.GetString());
+                        if (payload.TryGetProperty("base_instructions", out var bi) &&
+                            bi.TryGetProperty("provenance", out var prov) &&
+                            prov.TryGetProperty("model", out var sm))
+                            currentModel = fallbackModel = FriendlyModel(sm.GetString());
+                        continue;
+                    }
+                    if (type == "turn_context")
+                    {
+                        if (payload.TryGetProperty("turn_id", out var tid) && payload.TryGetProperty("model", out var model))
+                        {
+                            currentModel = FriendlyModel(model.GetString());
+                            modelByTurn[tid.GetString() ?? ""] = currentModel;
+                        }
+                        continue;
+                    }
+
+                    var utc = DateTime.Parse(root.GetProperty("timestamp").GetString()!, CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+                    var local = utc.ToLocalTime();
+                    if (local.Date < firstDay.Date || local.Date > lastDay.Date) continue;
+
+                    if (type == "event_msg" && payload.TryGetProperty("type", out var eventType) &&
+                        eventType.GetString() == "token_count" && payload.TryGetProperty("info", out var info) &&
+                        info.ValueKind == JsonValueKind.Object &&
+                        info.TryGetProperty("last_token_usage", out var lastUsage) &&
+                        lastUsage.ValueKind == JsonValueKind.Object)
+                    {
+                        countPoints.Add(ToPoint(local, currentModel, currentProject, lastUsage));
+                        continue;
+                    }
+                    if (type != "token_usage_record") continue;
+
+                    var turnId = payload.TryGetProperty("turn_id", out var tr) ? tr.GetString() ?? "" : "";
+                    var modelName = modelByTurn.GetValueOrDefault(turnId, fallbackModel);
+                    var usage = payload.GetProperty("usage");
+                    recordPoints.Add(ToPoint(local, modelName, currentProject, usage));
+                }
+                catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or KeyNotFoundException)
+                { /* Skip incomplete or legacy-shaped records without interrupting a refresh. */ }
+            }
+        }
+        catch (IOException) { /* Skip a file briefly unavailable during a write. */ }
+        points.AddRange(countPoints.Count > 0 ? countPoints : recordPoints);
+    }
+
+    private static UsagePoint ToPoint(DateTime time, string model, string project, JsonElement usage) => new(
+        time,
+        model,
+        project,
+        GetLong(usage, "input_tokens"),
+        GetLong(usage, "cached_input_tokens"),
+        GetLong(usage, "output_tokens"),
+        GetLong(usage, "reasoning_output_tokens"));
+
+    private static long GetLong(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.TryGetInt64(out var result) ? result : 0;
+
+    private static string FriendlyModel(string? model) => string.IsNullOrWhiteSpace(model)
+        ? "Unknown model"
+        : model.Replace("gpt-", "GPT ", StringComparison.OrdinalIgnoreCase)
+               .Replace("codex", "Codex", StringComparison.OrdinalIgnoreCase);
+
+    private static string FriendlyProject(string? cwd)
+    {
+        if (string.IsNullOrWhiteSpace(cwd)) return "Projectless";
+        var trimmed = cwd.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return Path.GetFileName(trimmed) is { Length: > 0 } name ? name : trimmed;
+    }
+}
+
+internal static class HistoryStore
+{
+    private static readonly string CachePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Codex Usage", "history.json");
+
+    public static HistoryCache? Load()
+    {
+        try
+        {
+            if (!File.Exists(CachePath)) return null;
+            var json = File.ReadAllText(CachePath);
+            var cache = JsonSerializer.Deserialize<HistoryCache>(json);
+            using var doc = JsonDocument.Parse(json);
+            return cache is not null && !doc.RootElement.TryGetProperty("FormatVersion", out _)
+                ? cache with { FormatVersion = 0 }
+                : cache;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return null; }
+    }
+
+    public static void Save(HistoryCache cache)
+    {
+        var directory = Path.GetDirectoryName(CachePath)!;
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(CachePath, JsonSerializer.Serialize(cache));
+    }
+
+    public static HistoryCache MergeToday(HistoryCache cache, UsageSnapshot snapshot)
+    {
+        var projects = snapshot.Points.GroupBy(point => point.Project)
+            .ToDictionary(group => group.Key, group => group.Sum(point => point.Total));
+        var hours = Enumerable.Range(0, 24).Select(hour =>
+        {
+            var hourPoints = snapshot.Points.Where(point => point.Time.Hour == hour).ToArray();
+            return new HourlyUsage(hour, hourPoints.Sum(point => point.Total),
+                hourPoints.GroupBy(point => point.Model).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
+                hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
+        }).ToArray();
+        var snapshotDay = snapshot.Day.Date;
+        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours);
+        var days = cache.Days.Select(day => day.Date.Date == snapshotDay ? today : day).ToList();
+        if (!days.Any(day => day.Date.Date == snapshotDay))
+        {
+            days.Add(today);
+            days = days.OrderBy(day => day.Date).TakeLast(30).ToList();
+        }
+        return cache with { Days = days };
+    }
+
+    public static bool ShouldAutoBuild(HistoryCache? cache) =>
+        cache is null || cache.FormatVersion < 4 ||
+        (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
+}
+
+internal sealed record ThemePalette(
+    string Name, Color Background, Color Panel, Color Text, Color Muted,
+    Color Primary, Color Secondary, Color Tertiary, Color[] Series);
+
+internal static class ThemeCatalog
+{
+    public static readonly IReadOnlyList<ThemePalette> All =
+    [
+        new("Night City", Color.FromArgb(9, 5, 24), Color.FromArgb(21, 16, 45), Color.FromArgb(244, 246, 255), Color.FromArgb(143, 151, 177),
+            Color.FromArgb(0, 218, 255), Color.FromArgb(255, 48, 190), Color.FromArgb(255, 174, 42),
+            [Color.FromArgb(134, 99, 255), Color.FromArgb(29, 211, 176), Color.FromArgb(255, 168, 76), Color.FromArgb(80, 156, 255), Color.FromArgb(244, 101, 153), Color.FromArgb(180, 188, 212)]),
+        new("Neon Sunset", Color.FromArgb(25, 9, 35), Color.FromArgb(40, 16, 47), Color.FromArgb(255, 242, 223), Color.FromArgb(185, 143, 157),
+            Color.FromArgb(255, 182, 39), Color.FromArgb(255, 77, 109), Color.FromArgb(198, 78, 255),
+            [Color.FromArgb(255, 182, 39), Color.FromArgb(255, 77, 109), Color.FromArgb(255, 119, 48), Color.FromArgb(198, 78, 255), Color.FromArgb(255, 217, 120), Color.FromArgb(222, 129, 186)]),
+        new("Toxic Rain", Color.FromArgb(6, 21, 15), Color.FromArgb(11, 33, 25), Color.FromArgb(234, 255, 216), Color.FromArgb(126, 165, 139),
+            Color.FromArgb(182, 255, 46), Color.FromArgb(0, 255, 200), Color.FromArgb(255, 214, 62),
+            [Color.FromArgb(182, 255, 46), Color.FromArgb(0, 255, 200), Color.FromArgb(87, 219, 69), Color.FromArgb(255, 214, 62), Color.FromArgb(48, 210, 255), Color.FromArgb(173, 205, 126)]),
+        new("Ion Storm", Color.FromArgb(7, 14, 40), Color.FromArgb(16, 26, 62), Color.FromArgb(236, 243, 255), Color.FromArgb(139, 153, 190),
+            Color.FromArgb(72, 229, 255), Color.FromArgb(157, 124, 255), Color.FromArgb(89, 124, 255),
+            [Color.FromArgb(72, 229, 255), Color.FromArgb(157, 124, 255), Color.FromArgb(89, 124, 255), Color.FromArgb(92, 180, 255), Color.FromArgb(206, 117, 255), Color.FromArgb(171, 196, 233)]),
+        new("Redline District", Color.FromArgb(22, 7, 7), Color.FromArgb(40, 16, 14), Color.FromArgb(255, 240, 223), Color.FromArgb(181, 137, 124),
+            Color.FromArgb(255, 59, 48), Color.FromArgb(255, 159, 28), Color.FromArgb(0, 205, 255),
+            [Color.FromArgb(255, 59, 48), Color.FromArgb(255, 159, 28), Color.FromArgb(255, 91, 75), Color.FromArgb(255, 205, 54), Color.FromArgb(0, 205, 255), Color.FromArgb(218, 153, 126)])
+    ];
+
+    public static ThemePalette Current { get; private set; } = All[0];
+    public static void Select(string? name) => Current = All.FirstOrDefault(t =>
+        string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase)) ?? All[0];
+}
+
+internal sealed record DashboardSettings(
+    int RefreshMinutes = 5,
+    string Theme = "Night City",
+    bool SnapshotEnabled = false,
+    int SnapshotMinutes = 15,
+    string SnapshotFolder = "",
+    bool HideProjectNames = true,
+    string SessionsFolder = "");
+
+internal static class SettingsStore
+{
+    private static readonly string SettingsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Codex Usage", "settings.json");
+
+    public static DashboardSettings Load()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath)) return new DashboardSettings();
+            return JsonSerializer.Deserialize<DashboardSettings>(File.ReadAllText(SettingsPath)) ?? new DashboardSettings();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        { return new DashboardSettings(); }
+    }
+
+    public static void Save(DashboardSettings settings)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings));
+    }
+}
+
+internal sealed class DashboardForm : Form
+{
+    private static ThemePalette Theme => ThemeCatalog.Current;
+    private static Color Bg => Theme.Background;
+    private static Color Panel => Theme.Panel;
+    private static Color TextMain => Theme.Text;
+    private static Color TextMuted => Theme.Muted;
+    private readonly UsageCanvas canvas = new() { Dock = DockStyle.Fill };
+    private readonly Label status = new()
+    {
+        AutoSize = false,
+        Width = 245,
+        Height = 24,
+        TextAlign = ContentAlignment.MiddleRight,
+        ForeColor = TextMuted,
+        Font = new Font("Segoe UI", 9f)
+    };
+    private readonly Button refresh = MakeButton("↻  Refresh now", 126, ThemeCatalog.Current.Primary);
+    private readonly Button rebuild = MakeButton("◷  Rebuild 30 days", 158, ThemeCatalog.Current.Secondary);
+    private readonly Button settings = MakeButton("⚙", 42, ThemeCatalog.Current.Tertiary);
+    private readonly System.Windows.Forms.Timer timer = new() { Interval = 5 * 60 * 1000 };
+    private readonly System.Windows.Forms.Timer snapshotTimer = new();
+    private CancellationTokenSource? refreshCts;
+    private bool isRefreshing;
+    private bool isRebuilding;
+    private int refreshMinutes = 5;
+    private DateTime? lastRefreshedAt;
+    private Panel header = null!;
+    private Label titleLabel = null!;
+    private DashboardSettings appSettings = new();
+
+    public DashboardForm()
+    {
+        Text = "Codex Usage";
+        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        appSettings = SettingsStore.Load();
+        if (string.IsNullOrWhiteSpace(appSettings.SessionsFolder))
+        {
+            appSettings = appSettings with { SessionsFolder = LogScanner.DefaultSessionsPath };
+            SettingsStore.Save(appSettings);
+        }
+        ThemeCatalog.Select(appSettings.Theme);
+        BackColor = Bg;
+        ForeColor = TextMain;
+        MinimumSize = new Size(920, 700);
+        Size = new Size(1180, 900);
+        StartPosition = FormStartPosition.CenterScreen;
+        DoubleBuffered = true;
+        refreshMinutes = Math.Clamp(appSettings.RefreshMinutes, 1, 120);
+        timer.Interval = refreshMinutes * 60 * 1000;
+        ConfigureSnapshotTimer();
+        settings.Font = new Font("Segoe UI Symbol", 12f, FontStyle.Bold);
+
+        header = new Panel { Dock = DockStyle.Top, Height = 74, BackColor = Bg, Padding = new Padding(34, 17, 34, 10) };
+        titleLabel = new Label
+        {
+            Text = "CODEX  /  USAGE",
+            AutoSize = true,
+            ForeColor = TextMain,
+            Font = new Font("Segoe UI Semibold", 13f),
+            Location = new Point(34, 21)
+        };
+        status.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        status.Location = new Point(header.Width - 560, 22);
+        refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        rebuild.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        settings.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        void LayoutHeader()
+        {
+            settings.Left = header.ClientSize.Width - settings.Width - 34;
+            rebuild.Left = settings.Left - rebuild.Width - 10;
+            refresh.Left = rebuild.Left - refresh.Width - 10;
+            status.Left = Math.Max(titleLabel.Right + 20, refresh.Left - status.Width - 18);
+            refresh.Top = rebuild.Top = settings.Top = (header.ClientSize.Height - refresh.Height) / 2;
+            status.Top = (header.ClientSize.Height - status.Height) / 2;
+        }
+        header.Resize += (_, _) => LayoutHeader();
+        header.Controls.AddRange([titleLabel, status, refresh, rebuild, settings]);
+        LayoutHeader();
+        Controls.Add(canvas);
+        Controls.Add(header);
+
+        refresh.Click += async (_, _) => await RefreshDataAsync();
+        rebuild.Click += async (_, _) => await RebuildHistoryAsync();
+        settings.Click += (_, _) => ShowSettingsMenu();
+        timer.Tick += async (_, _) => await RefreshDataAsync();
+        snapshotTimer.Tick += (_, _) => ExportSnapshot();
+        Shown += async (_, _) =>
+        {
+            timer.Start();
+            await RefreshDataAsync();
+            if (appSettings.SnapshotEnabled) ExportSnapshot();
+        };
+        FormClosed += (_, _) => { refreshCts?.Cancel(); snapshotTimer.Stop(); };
+        ApplyTheme();
+    }
+
+    private async Task RefreshDataAsync()
+    {
+        if (isRefreshing) return;
+        isRefreshing = true;
+        refreshCts = new CancellationTokenSource();
+        refresh.Enabled = false;
+        status.Text = "Scanning local logs…";
+        try
+        {
+            var snapshot = await LogScanner.ScanTodayAsync(refreshCts.Token, appSettings.SessionsFolder);
+            while (snapshot.Day.Date != DateTime.Today)
+                snapshot = await LogScanner.ScanTodayAsync(refreshCts.Token, appSettings.SessionsFolder);
+            canvas.Snapshot = snapshot;
+            canvas.History ??= HistoryStore.Load();
+            if (canvas.History is { } history)
+            {
+                canvas.History = HistoryStore.MergeToday(history, snapshot);
+                HistoryStore.Save(canvas.History);
+            }
+            canvas.Invalidate();
+            lastRefreshedAt = snapshot.RefreshedAt;
+            UpdateRefreshStatus();
+            if (HistoryStore.ShouldAutoBuild(canvas.History)) await RebuildHistoryAsync(true);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            status.Text = "Couldn’t read logs";
+            MessageBox.Show(this, ex.Message, "Codex Usage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally { refresh.Enabled = true; isRefreshing = false; }
+    }
+
+    private void ShowSettingsMenu()
+    {
+        var menu = new ContextMenuStrip
+        {
+            BackColor = Theme.Panel,
+            ForeColor = TextMain,
+            Font = new Font("Segoe UI", 9.5f),
+            ShowImageMargin = true,
+            Renderer = new NightCityMenuRenderer()
+        };
+        menu.Items.Add(new ToolStripLabel("CODEX DATA")
+        {
+            ForeColor = Theme.Tertiary,
+            Font = new Font("Segoe UI Semibold", 8.5f),
+            Padding = new Padding(8, 5, 8, 4)
+        });
+        var sourceItem = new ToolStripMenuItem("Choose session folder…")
+        {
+            ToolTipText = appSettings.SessionsFolder,
+            Padding = new Padding(7, 3, 10, 3)
+        };
+        sourceItem.Click += async (_, _) =>
+        {
+            if (!ChooseSessionsFolder()) return;
+            await RebuildHistoryAsync();
+            await RefreshDataAsync();
+        };
+        menu.Items.Add(sourceItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripLabel("REFRESH INTERVAL")
+        {
+            ForeColor = Theme.Tertiary,
+            Font = new Font("Segoe UI Semibold", 8.5f),
+            Padding = new Padding(8, 5, 8, 4)
+        });
+        foreach (var minutes in new[] { 1, 2, 5, 10, 15, 30, 60 })
+        {
+            var item = new ToolStripMenuItem(minutes == 1 ? "Every minute" : $"Every {minutes} minutes")
+            {
+                Checked = refreshMinutes == minutes,
+                CheckOnClick = false,
+                Tag = minutes,
+                Padding = new Padding(7, 3, 10, 3)
+            };
+            item.Click += (_, _) =>
+            {
+                refreshMinutes = (int)item.Tag!;
+                timer.Stop();
+                timer.Interval = refreshMinutes * 60 * 1000;
+                timer.Start();
+                appSettings = appSettings with { RefreshMinutes = refreshMinutes, Theme = Theme.Name };
+                SettingsStore.Save(appSettings);
+                UpdateRefreshStatus();
+            };
+            menu.Items.Add(item);
+        }
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripLabel("COLOR SCHEME")
+        {
+            ForeColor = Theme.Tertiary,
+            Font = new Font("Segoe UI Semibold", 8.5f),
+            Padding = new Padding(8, 5, 8, 4)
+        });
+        foreach (var palette in ThemeCatalog.All)
+        {
+            var item = new ToolStripMenuItem(palette.Name)
+            {
+                Checked = palette.Name == Theme.Name,
+                Tag = palette.Name,
+                Padding = new Padding(7, 3, 10, 3)
+            };
+            item.Click += (_, _) =>
+            {
+                ThemeCatalog.Select((string)item.Tag!);
+                appSettings = appSettings with { RefreshMinutes = refreshMinutes, Theme = Theme.Name };
+                SettingsStore.Save(appSettings);
+                ApplyTheme();
+                status.Text = $"Theme set to {Theme.Name}";
+            };
+            menu.Items.Add(item);
+        }
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripLabel("SNAPSHOT EXPORT")
+        {
+            ForeColor = Theme.Tertiary,
+            Font = new Font("Segoe UI Semibold", 8.5f),
+            Padding = new Padding(8, 5, 8, 4)
+        });
+        var enabledItem = new ToolStripMenuItem("Enable latest snapshot")
+        {
+            Checked = appSettings.SnapshotEnabled,
+            Padding = new Padding(7, 3, 10, 3)
+        };
+        enabledItem.Click += (_, _) =>
+        {
+            var enable = !appSettings.SnapshotEnabled;
+            if (enable && string.IsNullOrWhiteSpace(appSettings.SnapshotFolder) && !ChooseSnapshotFolder()) return;
+            appSettings = appSettings with { SnapshotEnabled = enable };
+            SettingsStore.Save(appSettings);
+            ConfigureSnapshotTimer();
+            if (enable) ExportSnapshot();
+            status.Text = enable ? "Local snapshot export enabled" : "Local snapshot export disabled";
+        };
+        menu.Items.Add(enabledItem);
+
+        var folderItem = new ToolStripMenuItem("Choose snapshot folder…") { Padding = new Padding(7, 3, 10, 3) };
+        folderItem.Click += (_, _) => ChooseSnapshotFolder();
+        menu.Items.Add(folderItem);
+
+        var privacyItem = new ToolStripMenuItem("Hide project names")
+        {
+            Checked = appSettings.HideProjectNames,
+            Padding = new Padding(7, 3, 10, 3)
+        };
+        privacyItem.Click += (_, _) =>
+        {
+            appSettings = appSettings with { HideProjectNames = !appSettings.HideProjectNames };
+            SettingsStore.Save(appSettings);
+            status.Text = appSettings.HideProjectNames ? "Snapshot project names hidden" : "Snapshot project names visible";
+        };
+        menu.Items.Add(privacyItem);
+        foreach (var minutes in new[] { 5, 15, 30, 60 })
+        {
+            var item = new ToolStripMenuItem($"Snapshot every {minutes} minutes")
+            {
+                Checked = appSettings.SnapshotMinutes == minutes,
+                Tag = minutes,
+                Padding = new Padding(7, 3, 10, 3)
+            };
+            item.Click += (_, _) =>
+            {
+                appSettings = appSettings with { SnapshotMinutes = (int)item.Tag! };
+                SettingsStore.Save(appSettings);
+                ConfigureSnapshotTimer();
+                status.Text = $"Snapshot interval set to {appSettings.SnapshotMinutes} min";
+            };
+            menu.Items.Add(item);
+        }
+        menu.Show(settings, new Point(settings.Width - menu.PreferredSize.Width, settings.Height + 2));
+    }
+
+    private bool ChooseSessionsFolder()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choose the Codex sessions folder to scan",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false,
+            InitialDirectory = Directory.Exists(appSettings.SessionsFolder)
+                ? appSettings.SessionsFolder
+                : LogScanner.DefaultSessionsPath
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return false;
+        appSettings = appSettings with { SessionsFolder = Path.GetFullPath(dialog.SelectedPath) };
+        SettingsStore.Save(appSettings);
+        status.Text = "Codex session folder selected";
+        return true;
+    }
+
+    private bool ChooseSnapshotFolder()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Choose a local or synced folder for codex-usage-latest.png",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = true,
+            InitialDirectory = Directory.Exists(appSettings.SnapshotFolder)
+                ? appSettings.SnapshotFolder
+                : Environment.GetFolderPath(Environment.SpecialFolder.MyPictures)
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return false;
+        appSettings = appSettings with { SnapshotFolder = dialog.SelectedPath };
+        SettingsStore.Save(appSettings);
+        status.Text = "Snapshot folder selected";
+        return true;
+    }
+
+    private void ConfigureSnapshotTimer()
+    {
+        snapshotTimer.Stop();
+        var minutes = appSettings.SnapshotMinutes is 5 or 15 or 30 or 60 ? appSettings.SnapshotMinutes : 15;
+        snapshotTimer.Interval = minutes * 60 * 1000;
+        if (appSettings.SnapshotEnabled && !string.IsNullOrWhiteSpace(appSettings.SnapshotFolder)) snapshotTimer.Start();
+    }
+
+    private void ExportSnapshot()
+    {
+        if (!appSettings.SnapshotEnabled || string.IsNullOrWhiteSpace(appSettings.SnapshotFolder) ||
+            canvas.Snapshot is null || canvas.Snapshot.Day.Date != DateTime.Today) return;
+        string? temporaryPath = null;
+        try
+        {
+            Directory.CreateDirectory(appSettings.SnapshotFolder);
+            var finalPath = Path.Combine(appSettings.SnapshotFolder, "codex-usage-latest.png");
+            temporaryPath = Path.Combine(appSettings.SnapshotFolder, $".codex-usage-{Guid.NewGuid():N}.tmp.png");
+            canvas.ExportPng(temporaryPath, appSettings.HideProjectNames);
+            File.Move(temporaryPath, finalPath, true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ExternalException)
+        {
+            snapshotTimer.Stop();
+            status.Text = "Snapshot export paused — check the selected folder";
+            if (temporaryPath is not null)
+            {
+                try { File.Delete(temporaryPath); } catch { }
+            }
+        }
+    }
+
+    private void ApplyTheme()
+    {
+        BackColor = Bg;
+        ForeColor = TextMain;
+        header.BackColor = Bg;
+        titleLabel.ForeColor = TextMain;
+        status.ForeColor = TextMuted;
+        canvas.BackColor = Bg;
+        ((NeonButton)refresh).SetAccent(Theme.Primary);
+        ((NeonButton)rebuild).SetAccent(Theme.Secondary);
+        ((NeonButton)settings).SetAccent(Theme.Tertiary);
+        Invalidate(true);
+    }
+
+    private void UpdateRefreshStatus()
+    {
+        status.Text = lastRefreshedAt is { } refreshed
+            ? $"Updated {refreshed:h:mm tt}  •  every {refreshMinutes} min"
+            : $"Refresh every {refreshMinutes} min";
+    }
+
+    private sealed class NightCityMenuRenderer : ToolStripProfessionalRenderer
+    {
+        public NightCityMenuRenderer() : base(new NightCityColorTable()) { RoundedEdges = true; }
+    }
+
+    private sealed class NightCityColorTable : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground => Theme.Panel;
+        public override Color MenuBorder => Color.FromArgb(205, Theme.Tertiary);
+        public override Color MenuItemSelected => Color.FromArgb(62, Theme.Tertiary);
+        public override Color MenuItemBorder => Color.FromArgb(150, Theme.Tertiary);
+        public override Color ImageMarginGradientBegin => Theme.Panel;
+        public override Color ImageMarginGradientMiddle => Theme.Panel;
+        public override Color ImageMarginGradientEnd => Theme.Panel;
+        public override Color CheckBackground => Color.FromArgb(80, Theme.Tertiary);
+        public override Color CheckSelectedBackground => Color.FromArgb(110, Theme.Tertiary);
+    }
+
+    private async Task RebuildHistoryAsync(bool automatic = false)
+    {
+        if (isRebuilding) return;
+        isRebuilding = true;
+        rebuild.Enabled = false;
+        if (!automatic) status.Text = "Rebuilding 30-day history…";
+        try
+        {
+            var history = await LogScanner.ScanHistoryAsync(
+                30, refreshCts?.Token ?? CancellationToken.None, appSettings.SessionsFolder);
+            HistoryStore.Save(history);
+            canvas.History = history;
+            canvas.Invalidate();
+            status.Text = $"30-day history built {history.BuiltAt:h:mm tt}";
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            status.Text = "Couldn’t rebuild history";
+            if (!automatic) MessageBox.Show(this, ex.Message, "Codex Usage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        finally { rebuild.Enabled = true; isRebuilding = false; }
+    }
+
+    private static Button MakeButton(string text, int width, Color accent) => new NeonButton(accent)
+    {
+        Text = text,
+        Width = width,
+        Height = 40,
+        BackColor = Panel,
+        ForeColor = TextMain,
+        Font = new Font("Segoe UI Semibold", 9f),
+        Cursor = Cursors.Hand,
+        TabStop = false
+    };
+
+    private sealed class NeonButton : Button
+    {
+        private Color accent;
+        private bool hovering;
+
+        public NeonButton(Color accent)
+        {
+            this.accent = accent;
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        public void SetAccent(Color color) { accent = color; BackColor = Panel; ForeColor = TextMain; Invalidate(); }
+
+        protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hovering = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Parent?.BackColor ?? Bg);
+            var bounds = new Rectangle(5, 5, Width - 11, Height - 11);
+            using var path = ButtonPath(bounds, 7);
+            using var fill = new LinearGradientBrush(bounds,
+                hovering ? Color.FromArgb(48, accent) : Shift(Panel, 8),
+                Shift(Panel, -7), 90f);
+            g.FillPath(fill, path);
+            using var glow = new Pen(Color.FromArgb(hovering ? 80 : 36, accent), hovering ? 6f : 4f);
+            using var edge = new Pen(Color.FromArgb(hovering ? 245 : 190, accent), 1.35f);
+            g.DrawPath(glow, path);
+            g.DrawPath(edge, path);
+            TextRenderer.DrawText(g, Text, Font, ClientRectangle, ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
+
+        private static GraphicsPath ButtonPath(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+            var d = radius * 2;
+            path.AddArc(r.X, r.Y, d, d, 180, 90); path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        private static Color Shift(Color color, int amount) => Color.FromArgb(color.A,
+            Math.Clamp(color.R + amount, 0, 255), Math.Clamp(color.G + amount, 0, 255),
+            Math.Clamp(color.B + amount, 0, 255));
+    }
+
+    private sealed class UsageCanvas : Control
+    {
+        private static Color[] Palette => Theme.Series;
+        private Rectangle historyHitArea;
+        private DailyUsage[] historyDays = [];
+        private DateTime? hoveredDate;
+        private Rectangle hourlyHitArea;
+        private long[] hourlyTotals = [];
+        private int? hoveredHour;
+        private DateTime? pinnedDate;
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public UsageSnapshot? Snapshot { get; set; }
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public HistoryCache? History { get; set; }
+
+        public UsageCanvas()
+        {
+            DoubleBuffered = true;
+            ResizeRedraw = true;
+            BackColor = Bg;
+            SetStyle(ControlStyles.Selectable, true);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (hourlyTotals.Length == 24 && hourlyHitArea.Contains(e.Location))
+            {
+                var ratio = Math.Clamp((e.X - hourlyHitArea.Left) / (float)Math.Max(1, hourlyHitArea.Width), 0, .9999f);
+                var nextHour = Math.Clamp((int)(ratio * 24), 0, 23);
+                Cursor = Cursors.Hand;
+                if (hoveredHour != nextHour || hoveredDate is not null)
+                {
+                    hoveredHour = nextHour;
+                    hoveredDate = null;
+                    Invalidate();
+                }
+                return;
+            }
+            if (historyDays.Length > 0 && historyHitArea.Contains(e.Location))
+            {
+                var ratio = Math.Clamp((e.X - historyHitArea.Left) / (float)Math.Max(1, historyHitArea.Width), 0, 1);
+                var index = Math.Clamp((int)Math.Round(ratio * (historyDays.Length - 1)), 0, historyDays.Length - 1);
+                var next = historyDays[index].Date;
+                Cursor = Cursors.Hand;
+                if (hoveredDate?.Date != next.Date || hoveredHour is not null)
+                {
+                    hoveredDate = next;
+                    hoveredHour = null;
+                    Invalidate();
+                }
+                return;
+            }
+            if (hoveredDate is not null || hoveredHour is not null)
+            {
+                hoveredDate = null;
+                hoveredHour = null;
+                Cursor = Cursors.Default;
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            Cursor = Cursors.Default;
+            if (hoveredDate is not null || hoveredHour is not null)
+            { hoveredDate = null; hoveredHour = null; Invalidate(); }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left || historyDays.Length == 0 || !historyHitArea.Contains(e.Location)) return;
+            var ratio = Math.Clamp((e.X - historyHitArea.Left) / (float)Math.Max(1, historyHitArea.Width), 0, 1);
+            var index = Math.Clamp((int)Math.Round(ratio * (historyDays.Length - 1)), 0, historyDays.Length - 1);
+            var clicked = historyDays[index].Date.Date;
+            pinnedDate = clicked == DateTime.Today || pinnedDate?.Date == clicked ? null : clicked;
+            hoveredHour = null;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Render(e.Graphics, false);
+        }
+
+        public void ExportPng(string path, bool hideProjectNames)
+        {
+            using var bitmap = new Bitmap(Math.Max(1, Width), Math.Max(1, Height), PixelFormat.Format32bppPArgb);
+            using var graphics = Graphics.FromImage(bitmap);
+            var savedHoveredDate = hoveredDate;
+            var savedHoveredHour = hoveredHour;
+            var savedPinnedDate = pinnedDate;
+            try
+            {
+                hoveredDate = null;
+                hoveredHour = null;
+                pinnedDate = null;
+                Render(graphics, hideProjectNames);
+                bitmap.Save(path, ImageFormat.Png);
+            }
+            finally
+            {
+                hoveredDate = savedHoveredDate;
+                hoveredHour = savedHoveredHour;
+                pinnedDate = savedPinnedDate;
+            }
+        }
+
+        private void Render(Graphics g, bool hideProjectNames)
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            using (var background = new LinearGradientBrush(ClientRectangle,
+                Lighten(Bg, 3), Darken(Bg, 4), 35f))
+                g.FillRectangle(background, ClientRectangle);
+            DrawAmbientLights(g);
+            if (Snapshot is null) { DrawCentered(g, "Reading today’s usage…"); return; }
+
+            var margin = Math.Max(28, Width / 35);
+            var hero = new Rectangle(margin, 16, Width - margin * 2, 195);
+            var chartHeight = Math.Max(220, (Height - 277) / 2);
+            var contentWidth = Width - margin * 2;
+            var hourlyWidth = (int)((contentWidth - 19) * .66f);
+            var chart = new Rectangle(margin, 230, hourlyWidth, chartHeight);
+            var projects = new Rectangle(chart.Right + 19, 230, contentWidth - hourlyWidth - 19, chartHeight);
+            var history = new Rectangle(margin, chart.Bottom + 19, contentWidth, chartHeight);
+            FillRound(g, hero, 22, Panel);
+            FillRound(g, chart, 22, Panel);
+            FillRound(g, projects, 22, Panel);
+            FillRound(g, history, 22, Panel);
+            StrokeRound(g, hero, 22, Color.FromArgb(55, Theme.Secondary));
+            StrokeRound(g, chart, 22, Color.FromArgb(45, Theme.Primary));
+            StrokeRound(g, projects, 22, Color.FromArgb(45, Theme.Tertiary));
+            StrokeRound(g, history, 22, Color.FromArgb(45, Theme.Secondary));
+            DrawHero(g, hero, Snapshot);
+            DrawChart(g, chart, Snapshot, History, pinnedDate);
+            DrawProjects(g, projects, Snapshot, History, hoveredDate, hoveredHour, pinnedDate, hideProjectNames);
+            DrawHistory(g, history, History);
+        }
+
+        private static void DrawHero(Graphics g, Rectangle r, UsageSnapshot s)
+        {
+            using var label = new Font("Segoe UI Semibold", 10f);
+            using var value = new Font("Segoe UI Variable Display", 37f, FontStyle.Bold);
+            using var small = new Font("Segoe UI Semibold", 10f);
+            g.DrawString("TODAY’S TOKEN USAGE", label, new SolidBrush(TextMuted), r.X + 28, r.Y + 24);
+            g.DrawString(Compact(s.Total), value, new SolidBrush(TextMain), r.X + 24, r.Y + 47);
+            var cards = new[]
+            {
+                ("INPUT", s.Input, Palette[0]),
+                ("CACHED", s.Cached, Palette[1]),
+                ("OUTPUT", s.Output, Palette[2]),
+                ("REASONING", s.Reasoning, Palette[3])
+            };
+            var x = r.X + Math.Max(310, r.Width / 3);
+            var width = Math.Max(110, (r.Right - x - 18) / 4);
+            foreach (var item in cards)
+            {
+                using var dot = new SolidBrush(item.Item3);
+                g.FillEllipse(dot, x, r.Y + 61, 8, 8);
+                g.DrawString(item.Item1, small, new SolidBrush(TextMuted), x + 14, r.Y + 55);
+                using var metric = new Font("Segoe UI Variable Display Semibold", 19f);
+                g.DrawString(Compact(item.Item2), metric, new SolidBrush(TextMain), x, r.Y + 82);
+                x += width;
+            }
+            g.DrawString($"{s.Points.Count:N0} responses across {s.FilesScanned:N0} log files", small,
+                new SolidBrush(TextMuted), r.X + 29, r.Bottom - 38);
+        }
+
+        private void DrawChart(Graphics g, Rectangle r, UsageSnapshot s, HistoryCache? history, DateTime? selectedDate)
+        {
+            using var title = new Font("Segoe UI Semibold", 12f);
+            using var caption = new Font("Segoe UI", 9f);
+            var chartDate = selectedDate?.Date ?? DateTime.Today;
+            var heading = chartDate == DateTime.Today ? "Usage through the day" : $"Usage through {chartDate:MMM d}";
+            g.DrawString(heading, title, new SolidBrush(TextMain), r.X + 28, r.Y + 22);
+
+            Dictionary<string, long[]> byModel;
+            if (chartDate == DateTime.Today)
+            {
+                byModel = s.Points.GroupBy(p => p.Model).ToDictionary(group => group.Key,
+                    group => Enumerable.Range(0, 24).Select(hour => group.Where(p => p.Time.Hour == hour).Sum(p => p.Total)).ToArray());
+            }
+            else
+            {
+                var day = history?.Days.FirstOrDefault(item => item.Date.Date == chartDate);
+                byModel = (day?.Hours ?? []).SelectMany(hour => hour.Models.Select(model => (hour.Hour, model.Key, model.Value)))
+                    .GroupBy(item => item.Key).ToDictionary(group => group.Key, group =>
+                    {
+                        var values = new long[24];
+                        foreach (var item in group) values[item.Hour] = item.Value;
+                        return values;
+                    });
+            }
+            var models = byModel.OrderByDescending(model => model.Value.Sum()).ToArray();
+            var legendX = r.Right - 28;
+            for (var i = models.Length - 1; i >= 0; i--)
+            {
+                var text = $"●  {models[i].Key}";
+                var size = g.MeasureString(text, caption);
+                legendX -= (int)size.Width + 18;
+                using var brush = new SolidBrush(Palette[i % Palette.Length]);
+                g.DrawString(text, caption, brush, legendX, r.Y + 25);
+            }
+
+            var plot = Rectangle.FromLTRB(r.X + 60, r.Y + 72, r.Right - 28, r.Bottom - 42);
+            var hourly = models.Select(model => model.Value).ToArray();
+            var totals = Enumerable.Range(0, 24).Select(h => hourly.Sum(a => a[h])).ToArray();
+            hourlyHitArea = plot;
+            hourlyTotals = totals;
+            var max = Math.Max(1, totals.Max());
+            var niceMax = NiceCeiling(max);
+
+            using var gridPen = new Pen(Color.FromArgb(48, TextMuted), 1);
+            for (var i = 0; i <= 4; i++)
+            {
+                var y = plot.Bottom - plot.Height * i / 4f;
+                g.DrawLine(gridPen, plot.Left, y, plot.Right, y);
+                var label = Compact(niceMax * i / 4);
+                var sz = g.MeasureString(label, caption);
+                g.DrawString(label, caption, new SolidBrush(TextMuted), plot.Left - sz.Width - 10, y - sz.Height / 2);
+            }
+
+            var barSlot = plot.Width / 24f;
+            var barWidth = Math.Max(5, barSlot * .64f);
+            for (var h = 0; h < 24; h++)
+            {
+                var y = (float)plot.Bottom;
+                for (var m = 0; m < models.Length; m++)
+                {
+                    var height = (float)(hourly[m][h] / (double)niceMax * plot.Height);
+                    if (height <= 0) continue;
+                    var color = Palette[m % Palette.Length];
+                    var x = plot.Left + h * barSlot + (barSlot - barWidth) / 2;
+                    DrawSoftBarGlow(g, new RectangleF(x, y - height, barWidth, height), color);
+                    using var brush = new LinearGradientBrush(
+                        new RectangleF(x, y - height, barWidth, Math.Max(1, height)),
+                        Lighten(color, 80), Saturate(color, 1.28f), LinearGradientMode.Vertical);
+                    g.FillRectangle(brush, x, y - height, barWidth, height);
+                    using var shine = new Pen(Color.FromArgb(235, 235, 250, 255), 1.25f);
+                    g.DrawLine(shine, x + 1, y - height, x + barWidth - 1, y - height);
+                    y -= height;
+                }
+            }
+            if (hoveredHour is { } selectedHour)
+            {
+                var x = plot.Left + selectedHour * barSlot;
+                using var columnGlow = new SolidBrush(Color.FromArgb(22, Theme.Tertiary));
+                using var columnEdge = new Pen(Color.FromArgb(120, Theme.Tertiary), 1f);
+                g.FillRectangle(columnGlow, x + 1, plot.Top, barSlot - 2, plot.Height);
+                g.DrawRectangle(columnEdge, x + 1, plot.Top, barSlot - 2, plot.Height);
+
+                var barTop = plot.Bottom - totals[selectedHour] / (float)niceMax * plot.Height;
+                var tooltip = new Rectangle(
+                    Math.Clamp((int)(x + barSlot / 2) - 86, plot.Left, plot.Right - 172),
+                    Math.Max(plot.Top + 5, (int)barTop - 58), 172, 46);
+                FillRound(g, tooltip, 8, Darken(Panel, 4));
+                StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
+                using var tipLabel = new Font("Segoe UI Semibold", 8.5f);
+                using var tipValue = new Font("Segoe UI Semibold", 10f);
+                g.DrawString(HourRange(selectedHour), tipLabel, new SolidBrush(TextMuted), tooltip.X + 9, tooltip.Y + 5);
+                g.DrawString($"{totals[selectedHour]:N0} tokens", tipValue, new SolidBrush(TextMain), tooltip.X + 9, tooltip.Y + 21);
+            }
+            foreach (var h in new[] { 0, 4, 8, 12, 16, 20, 23 })
+            {
+                var text = h == 0 ? "12a" : h < 12 ? $"{h}a" : h == 12 ? "12p" : $"{h - 12}p";
+                var sz = g.MeasureString(text, caption);
+                var x = plot.Left + (h + .5f) * barSlot - sz.Width / 2;
+                g.DrawString(text, caption, new SolidBrush(TextMuted), x, plot.Bottom + 10);
+            }
+            if (totals.All(total => total == 0)) DrawCentered(g, $"No token usage recorded on {chartDate:MMM d}", plot);
+        }
+
+        private static void DrawProjects(Graphics g, Rectangle r, UsageSnapshot s, HistoryCache? history,
+            DateTime? selectedDate, int? selectedHour, DateTime? pinnedDate, bool hideProjectNames)
+        {
+            using var title = new Font("Segoe UI Semibold", 12f);
+            using var label = new Font("Segoe UI Semibold", 9f);
+            using var caption = new Font("Segoe UI", 8.5f);
+            g.DrawString("Usage by project", title, new SolidBrush(TextMain), r.X + 24, r.Y + 22);
+            var effectiveDate = (selectedDate ?? pinnedDate ?? DateTime.Today).Date;
+            var isHistoricalDay = effectiveDate != DateTime.Today;
+            var dateLabel = selectedHour is { } hour
+                ? $"{effectiveDate:MMM d} · {ShortHourRange(hour)}".ToUpperInvariant()
+                : isHistoricalDay ? effectiveDate.ToString("MMM d").ToUpperInvariant() : "TODAY";
+            var dateSize = g.MeasureString(dateLabel, caption);
+            g.DrawString(dateLabel, caption, new SolidBrush(Theme.Tertiary), r.Right - dateSize.Width - 24, r.Y + 27);
+
+            List<(string Name, long Tokens)> ranked;
+            if (selectedHour is { } selected)
+            {
+                if (!isHistoricalDay)
+                {
+                    ranked = s.Points.Where(p => p.Time.Hour == selected).GroupBy(p => p.Project)
+                        .Select(group => (Name: group.Key, Tokens: group.Sum(p => p.Total)))
+                        .OrderByDescending(project => project.Tokens).ToList();
+                }
+                else
+                {
+                    var hourBucket = history?.Days.FirstOrDefault(day => day.Date.Date == effectiveDate)?.Hours?
+                        .FirstOrDefault(item => item.Hour == selected);
+                    ranked = (hourBucket?.Projects ?? []).Select(project => (Name: project.Key, Tokens: project.Value))
+                        .OrderByDescending(project => project.Tokens).ToList();
+                }
+            }
+            else if (!isHistoricalDay)
+            {
+                ranked = s.Points.GroupBy(p => p.Project)
+                    .Select(group => (Name: group.Key, Tokens: group.Sum(p => p.Total)))
+                    .OrderByDescending(project => project.Tokens).ToList();
+            }
+            else
+            {
+                var day = history?.Days.FirstOrDefault(d => d.Date.Date == effectiveDate);
+                ranked = (day?.Projects ?? []).Select(project => (Name: project.Key, Tokens: project.Value))
+                    .OrderByDescending(project => project.Tokens).ToList();
+            }
+            if (ranked.Count > 6)
+            {
+                var other = ranked.Skip(5).Sum(project => project.Tokens);
+                ranked = ranked.Take(5).Append(("Other", other)).ToList();
+            }
+            if (ranked.Count == 0)
+            {
+                DrawCentered(g, "No project usage today", Rectangle.FromLTRB(r.X, r.Y + 55, r.Right, r.Bottom));
+                return;
+            }
+
+            var max = Math.Max(1, ranked[0].Tokens);
+            var left = r.X + 24;
+            var right = r.Right - 24;
+            var available = r.Bottom - (r.Y + 70) - 18;
+            var rowHeight = Math.Min(48, available / Math.Max(1, ranked.Count));
+            for (var i = 0; i < ranked.Count; i++)
+            {
+                var item = ranked[i];
+                var y = r.Y + 67 + i * rowHeight;
+                var value = Compact(item.Tokens);
+                var valueSize = g.MeasureString(value, caption);
+                var nameRect = new Rectangle(left, y, Math.Max(40, right - left - (int)valueSize.Width - 12), 18);
+                var displayName = hideProjectNames && item.Name != "Other" ? $"Project {i + 1}" : item.Name;
+                TextRenderer.DrawText(g, displayName, label, nameRect, TextMain,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+                g.DrawString(value, caption, new SolidBrush(TextMuted), right - valueSize.Width, y + 1);
+
+                var track = new RectangleF(left, y + 23, right - left, 7);
+                using var trackBrush = new SolidBrush(Color.FromArgb(45, TextMuted));
+                g.FillRectangle(trackBrush, track);
+                var fillWidth = Math.Max(2, track.Width * item.Tokens / (float)max);
+                var color = Palette[i % Palette.Length];
+                using var glow = new Pen(Color.FromArgb(52, color), 8f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+                using var core = new Pen(Lighten(color, 38), 4f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+                var x1 = track.Left + 3;
+                var x2 = Math.Max(x1, track.Left + fillWidth - 3);
+                g.DrawLine(glow, x1, track.Top + 3.5f, x2, track.Top + 3.5f);
+                g.DrawLine(core, x1, track.Top + 3.5f, x2, track.Top + 3.5f);
+            }
+        }
+
+        private void DrawHistory(Graphics g, Rectangle r, HistoryCache? history)
+        {
+            using var title = new Font("Segoe UI Semibold", 12f);
+            using var caption = new Font("Segoe UI", 9f);
+            g.DrawString("Rolling 30-day usage", title, new SolidBrush(TextMain), r.X + 28, r.Y + 22);
+            if (history is null)
+            {
+                DrawCentered(g, "Building daily history…", Rectangle.FromLTRB(r.X, r.Y + 55, r.Right, r.Bottom));
+                return;
+            }
+            g.DrawString($"Built {history.BuiltAt:MMM d, h:mm tt}", caption, new SolidBrush(TextMuted), r.Right - 145, r.Y + 27);
+            var plot = Rectangle.FromLTRB(r.X + 60, r.Y + 72, r.Right - 28, r.Bottom - 42);
+            var days = history.Days.OrderBy(d => d.Date).ToArray();
+            historyHitArea = plot;
+            historyDays = days;
+            var max = Math.Max(1, days.Max(d => d.Tokens));
+            var niceMax = NiceCeiling(max);
+            using var gridPen = new Pen(Color.FromArgb(48, TextMuted), 1);
+            for (var i = 0; i <= 4; i++)
+            {
+                var y = plot.Bottom - plot.Height * i / 4f;
+                g.DrawLine(gridPen, plot.Left, y, plot.Right, y);
+                var label = Compact(niceMax * i / 4);
+                var size = g.MeasureString(label, caption);
+                g.DrawString(label, caption, new SolidBrush(TextMuted), plot.Left - size.Width - 10, y - size.Height / 2);
+            }
+            if (days.Length > 1)
+            {
+                var points = days.Select((day, i) => new PointF(
+                    plot.Left + i * plot.Width / (float)(days.Length - 1),
+                    plot.Bottom - day.Tokens / (float)niceMax * plot.Height)).ToArray();
+                using var area = new GraphicsPath();
+                area.AddLines(points);
+                area.AddLine(points[^1].X, points[^1].Y, points[^1].X, plot.Bottom);
+                area.AddLine(points[^1].X, plot.Bottom, points[0].X, plot.Bottom);
+                area.CloseFigure();
+                using var areaBrush = new LinearGradientBrush(plot, Color.FromArgb(80, Theme.Primary),
+                    Color.FromArgb(2, Theme.Secondary), LinearGradientMode.Vertical);
+                g.FillPath(areaBrush, area);
+                using var glowFar = new Pen(Color.FromArgb(13, Theme.Primary), 20f) { LineJoin = LineJoin.Round };
+                using var glowMid = new Pen(Color.FromArgb(25, Theme.Primary), 14f) { LineJoin = LineJoin.Round };
+                using var glowNear = new Pen(Color.FromArgb(48, Theme.Secondary), 9f) { LineJoin = LineJoin.Round };
+                using var glowCore = new Pen(Color.FromArgb(76, Theme.Secondary), 5f) { LineJoin = LineJoin.Round };
+                using var lineBrush = new LinearGradientBrush(plot, Theme.Primary, Theme.Secondary, 0f);
+                using var line = new Pen(lineBrush, 2.8f) { LineJoin = LineJoin.Round };
+                g.DrawLines(glowFar, points); g.DrawLines(glowMid, points);
+                g.DrawLines(glowNear, points); g.DrawLines(glowCore, points); g.DrawLines(line, points);
+                using var dot = new SolidBrush(Lighten(Theme.Secondary, 35));
+                foreach (var p in points) g.FillEllipse(dot, p.X - 3.5f, p.Y - 3.5f, 7, 7);
+                if (pinnedDate is { } pinned)
+                {
+                    var pinnedIndex = Array.FindIndex(days, day => day.Date.Date == pinned.Date);
+                    if (pinnedIndex >= 0)
+                    {
+                        var point = points[pinnedIndex];
+                        using var pinnedGlow = new Pen(Color.FromArgb(70, Theme.Tertiary), 8f);
+                        using var pinnedRing = new Pen(Theme.Tertiary, 2f);
+                        g.DrawEllipse(pinnedGlow, point.X - 8, point.Y - 8, 16, 16);
+                        g.DrawEllipse(pinnedRing, point.X - 7, point.Y - 7, 14, 14);
+                    }
+                }
+                if (hoveredDate is { } selected)
+                {
+                    var index = Array.FindIndex(days, day => day.Date.Date == selected.Date);
+                    if (index >= 0)
+                    {
+                        var point = points[index];
+                        using var guide = new Pen(Color.FromArgb(105, Theme.Tertiary), 1f);
+                        g.DrawLine(guide, point.X, plot.Top, point.X, plot.Bottom);
+                        using var halo = new SolidBrush(Color.FromArgb(65, Theme.Secondary));
+                        using var center = new SolidBrush(Lighten(Theme.Secondary, 55));
+                        g.FillEllipse(halo, point.X - 10, point.Y - 10, 20, 20);
+                        g.FillEllipse(center, point.X - 5, point.Y - 5, 10, 10);
+
+                        var modelTotals = (days[index].Hours ?? []).SelectMany(hour => hour.Models)
+                            .GroupBy(model => model.Key)
+                            .Select(group => (Name: group.Key, Tokens: group.Sum(model => model.Value)))
+                            .OrderByDescending(model => model.Tokens).ToArray();
+                        const int tooltipWidth = 250;
+                        var tooltipHeight = 50 + modelTotals.Length * 20;
+                        var tooltipX = Math.Clamp((int)point.X - tooltipWidth / 2, plot.Left, plot.Right - tooltipWidth);
+                        var tooltipY = (int)point.Y - tooltipHeight - 12;
+                        if (tooltipY < plot.Top + 4) tooltipY = (int)point.Y + 14;
+                        tooltipY = Math.Min(tooltipY, plot.Bottom - tooltipHeight - 4);
+                        var tooltip = new Rectangle(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
+                        FillRound(g, tooltip, 8, Darken(Panel, 4));
+                        StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
+                        using var tipDate = new Font("Segoe UI Semibold", 8.5f);
+                        using var tipValue = new Font("Segoe UI Semibold", 10f);
+                        g.DrawString(days[index].Date.ToString("dddd, MMM d"), tipDate,
+                            new SolidBrush(TextMuted), tooltip.X + 10, tooltip.Y + 6);
+                        g.DrawString($"{days[index].Tokens:N0} tokens", tipValue,
+                            new SolidBrush(TextMain), tooltip.X + 10, tooltip.Y + 23);
+                        using var modelFont = new Font("Segoe UI", 8.5f);
+                        for (var modelIndex = 0; modelIndex < modelTotals.Length; modelIndex++)
+                        {
+                            var model = modelTotals[modelIndex];
+                            var rowY = tooltip.Y + 48 + modelIndex * 20;
+                            var color = Palette[modelIndex % Palette.Length];
+                            using var modelDot = new SolidBrush(color);
+                            g.FillEllipse(modelDot, tooltip.X + 11, rowY + 4, 7, 7);
+                            var valueText = Compact(model.Tokens);
+                            var valueSize = g.MeasureString(valueText, modelFont);
+                            var nameRect = new Rectangle(tooltip.X + 25, rowY,
+                                Math.Max(35, tooltip.Width - 47 - (int)valueSize.Width), 16);
+                            TextRenderer.DrawText(g, model.Name, modelFont, nameRect, TextMuted,
+                                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
+                                TextFormatFlags.NoPadding);
+                            g.DrawString(valueText, modelFont, new SolidBrush(TextMain),
+                                tooltip.Right - valueSize.Width - 11, rowY);
+                        }
+                    }
+                }
+            }
+            foreach (var i in new[] { 0, 7, 14, 21, 29 })
+            {
+                if (i >= days.Length) continue;
+                var text = days[i].Date.ToString("MMM d");
+                var size = g.MeasureString(text, caption);
+                var x = plot.Left + i * plot.Width / Math.Max(1f, days.Length - 1) - size.Width / 2;
+                g.DrawString(text, caption, new SolidBrush(TextMuted), x, plot.Bottom + 10);
+            }
+        }
+
+        private static long NiceCeiling(long value)
+        {
+            var power = Math.Pow(10, Math.Floor(Math.Log10(value)));
+            var scaled = value / power;
+            var nice = scaled <= 1 ? 1 :
+                scaled <= 1.25 ? 1.25 :
+                scaled <= 1.5 ? 1.5 :
+                scaled <= 2 ? 2 :
+                scaled <= 2.5 ? 2.5 :
+                scaled <= 3 ? 3 :
+                scaled <= 4 ? 4 :
+                scaled <= 5 ? 5 :
+                scaled <= 7.5 ? 7.5 : 10;
+            return (long)Math.Ceiling(nice * power);
+        }
+
+        private static string Compact(long value) => value switch
+        {
+            >= 1_000_000_000 => $"{value / 1_000_000_000d:0.##}B",
+            >= 1_000_000 => $"{value / 1_000_000d:0.##}M",
+            >= 1_000 => $"{value / 1_000d:0.#}K",
+            _ => value.ToString("N0")
+        };
+
+        private static string HourRange(int hour)
+        {
+            var start = DateTime.Today.AddHours(hour);
+            return $"{start:h:mm tt} – {start.AddHours(1):h:mm tt}";
+        }
+
+        private static string ShortHourRange(int hour)
+        {
+            var start = DateTime.Today.AddHours(hour);
+            return $"{start:h tt}–{start.AddHours(1):h tt}";
+        }
+
+        private static void FillRound(Graphics g, Rectangle r, int radius, Color color)
+        {
+            using var path = new GraphicsPath();
+            var d = radius * 2;
+            path.AddArc(r.X, r.Y, d, d, 180, 90); path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            using var brush = new SolidBrush(color); g.FillPath(brush, path);
+        }
+
+        private static void StrokeRound(Graphics g, Rectangle r, int radius, Color color)
+        {
+            using var path = RoundedPath(r, radius);
+            using var glow = new Pen(Color.FromArgb(Math.Max(8, color.A / 3), color), 5f);
+            using var line = new Pen(color, 1f);
+            g.DrawPath(glow, path);
+            g.DrawPath(line, path);
+        }
+
+        private static GraphicsPath RoundedPath(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+            var d = radius * 2;
+            path.AddArc(r.X, r.Y, d, d, 180, 90); path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        private static void DrawAmbientLights(Graphics g)
+        {
+            var colors = new[] { Color.FromArgb(95, Theme.Primary), Color.FromArgb(90, Theme.Secondary), Color.FromArgb(75, Theme.Tertiary) };
+            for (var i = 0; i < 42; i++)
+            {
+                var x = (i * 197 + 43) % Math.Max(1, g.VisibleClipBounds.Width);
+                var y = (i * 83 + 29) % Math.Max(1, g.VisibleClipBounds.Height);
+                var size = i % 9 == 0 ? 2.4f : 1.2f;
+                using var brush = new SolidBrush(colors[i % colors.Length]);
+                g.FillEllipse(brush, x, y, size, size);
+            }
+        }
+
+        private static Color Lighten(Color color, int amount) => Color.FromArgb(color.A,
+            Math.Min(255, color.R + amount), Math.Min(255, color.G + amount), Math.Min(255, color.B + amount));
+
+        private static Color Darken(Color color, int amount) => Color.FromArgb(color.A,
+            Math.Max(0, color.R - amount), Math.Max(0, color.G - amount), Math.Max(0, color.B - amount));
+
+        private static Color Saturate(Color color, float amount)
+        {
+            var average = (color.R + color.G + color.B) / 3f;
+            return Color.FromArgb(color.A,
+                Math.Clamp((int)(average + (color.R - average) * amount), 0, 255),
+                Math.Clamp((int)(average + (color.G - average) * amount), 0, 255),
+                Math.Clamp((int)(average + (color.B - average) * amount), 0, 255));
+        }
+
+        private static void DrawSoftBarGlow(Graphics g, RectangleF bar, Color color)
+        {
+            // Several translucent one-pixel steps read as a soft halo at normal DPI,
+            // without softening the bright bar drawn over the top.
+            for (var spread = 10; spread >= 1; spread--)
+            {
+                var proximity = 11 - spread;
+                var alpha = 2 + proximity * 2;
+                using var brush = new SolidBrush(Color.FromArgb(alpha, color));
+                g.FillRectangle(brush, bar.X - spread, bar.Y - spread,
+                    bar.Width + spread * 2, bar.Height + spread * 2);
+            }
+        }
+
+        private static void DrawCentered(Graphics g, string text, Rectangle? rect = null)
+        {
+            using var font = new Font("Segoe UI", 11f);
+            var bounds = rect ?? new Rectangle(0, 0, (int)g.VisibleClipBounds.Width, (int)g.VisibleClipBounds.Height);
+            var size = g.MeasureString(text, font);
+            g.DrawString(text, font, new SolidBrush(TextMuted), bounds.Left + (bounds.Width - size.Width) / 2,
+                bounds.Top + (bounds.Height - size.Height) / 2);
+        }
+    }
+}

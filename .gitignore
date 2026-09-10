@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+dist/
+
+# User and IDE state
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Local settings, logs, and generated captures
+settings.json
+history.json
+*.jsonl
+codex-usage-latest.png
+*.tmp.png
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
