@@ -1,6 +1,6 @@
 # Codex Usage for macOS
 
-A native SwiftUI and Swift Charts client for macOS 14 or later. It shares protocol v1 with the Windows client and receiver at `37cfdb4`. No receiver changes or third-party Swift packages are required.
+A native SwiftUI and Swift Charts client for macOS 14 or later. Version 1.1 shares aggregate protocol v1 with the Windows client and receiver. No third-party Swift packages are required.
 
 ## Build and run
 
@@ -39,6 +39,8 @@ Reporting starts disabled. In **Settings → Network**:
 4. Select the project-detail level, enable reporting, and save.
 
 Pairing derives the key locally, verifies an encrypted query, and stores only the derived 32-byte key in macOS Keychain. Keychain entries are scoped to the receiver and client ID and are device-local. The passphrase is cleared from the form and never persisted or transmitted. Anonymous project IDs are the default; **Project names** is an explicit opt-in. No project breakdown merges rows into `All projects`.
+
+Local development bundles are ad-hoc signed, so rebuilding changes the app's Keychain identity. Keychain reads are noninteractive and cached for the running app. An accessible credential from the earlier service migrates automatically; if macOS will not release it to the rebuilt app, Settings asks for the receiver shared passphrase once and safely recreates the derived-key item under the stable service. The app never asks for or changes the Mac login Keychain password.
 
 Normal refreshes replace the current and previous UTC hours. The first successful refresh after 2 a.m. local time replaces 30 local calendar days, as does a rebuild. A failed attempt does not advance the successful full-sync marker. Network and privacy configuration changes also queue full reconciliation. Combined totals are labeled as the last successful sync and are hidden when they refer to a previous local day or reporting is disabled.
 

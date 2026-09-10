@@ -16,6 +16,8 @@ import UsageCore
     @Published var filesScanned = 0
     private var lastSnapshot: Date?
     private var snapshotError: String?
+    private var cachedCredential: (account: String, key: Data)?
+    private var blockedCredentialAccount: String?
     var selectedDay: Date { Calendar.current.startOfDay(for: selectedDate ?? Date()) }
     var selectedPoints: [UsagePoint] {
         points.filter { Calendar.current.isDate($0.time, inSameDayAs: selectedDay) }
@@ -77,7 +79,7 @@ import UsageCore
             if scan.malformedRecords > 0 { status += " · \(scan.malformedRecords) incomplete records skipped" }
             if config.reportingEnabled {
                 do {
-                    let key = try KeychainStore.read(account: config.credentialAccount)
+                    let key = try credentialKey(account: config.credentialAccount)
                     let forceFull = network.needsFullSync == true
                     let next = try await SyncEngine.sync(settings: config, points: points, previous: network, key: key, force: forceFull)
                     try LocalStore.save(next, name: "mac-network-state.json")
@@ -98,13 +100,16 @@ import UsageCore
         }
         if draft.reportingEnabled {
             _ = try NetworkClient.endpoint(draft.receiverURL, path: "health")
-            _ = try KeychainStore.read(account: draft.credentialAccount)
+            _ = try credentialKey(account: draft.credentialAccount)
             guard !draft.machineName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, draft.machineName.utf16.count <= 100 else {
                 throw UsageError.invalid("Use a machine name of 1–100 characters.")
             }
         }
         if settings.credentialAccount != draft.credentialAccount || settings.projectPrivacy != draft.projectPrivacy ||
             settings.sessionsFolder != draft.sessionsFolder {
+            if settings.credentialAccount != draft.credentialAccount {
+                cachedCredential = nil; blockedCredentialAccount = nil
+            }
             network = NetworkState(); network.needsFullSync = true
             try LocalStore.save(network, name: "mac-network-state.json")
         }
@@ -115,7 +120,7 @@ import UsageCore
     }
     func pairAndTest(_ draft: UsageCore.Settings, passphrase: String) async throws {
         let key: Data
-        if passphrase.isEmpty { key = try KeychainStore.read(account: draft.credentialAccount) }
+        if passphrase.isEmpty { key = try credentialKey(account: draft.credentialAccount) }
         else {
             key = try await Task.detached(priority: .userInitiated) {
                 try await NetworkClient.pair(settings: draft, passphrase: passphrase)
@@ -123,6 +128,21 @@ import UsageCore
         }
         _ = try await SyncEngine.sync(settings: draft, points: [], previous: NetworkState(), key: key, query: true)
         try KeychainStore.save(key, account: draft.credentialAccount)
+        cachedCredential = (draft.credentialAccount, key); blockedCredentialAccount = nil
+    }
+    private func credentialKey(account: String) throws -> Data {
+        if let cachedCredential, cachedCredential.account == account { return cachedCredential.key }
+        if blockedCredentialAccount == account {
+            throw UsageError.invalid("The saved network credential needs repair. Re-enter the receiver shared passphrase in Settings; no Keychain password is required.")
+        }
+        do {
+            let key = try KeychainStore.read(account: account)
+            cachedCredential = (account, key)
+            return key
+        } catch {
+            blockedCredentialAccount = account
+            throw error
+        }
     }
     func exportSnapshot() {
         do {

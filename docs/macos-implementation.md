@@ -4,7 +4,7 @@
 
 Read-only checks on 2026-09-10 confirmed:
 
-- Git root: `/Users/steve.porter/codex/CodexUsage`.
+- Repository root checked out on the development Mac.
 - Origin: `https://github.com/osiristlg/CodexUsage.git`.
 - Clean `dev/1.1` checkout and `origin/dev/1.1` at `37cfdb4`.
 - Dedicated implementation branch: `codex/macos-client`.
@@ -17,7 +17,7 @@ Read-only checks on 2026-09-10 confirmed:
 2. Streaming log scanner, hourly aggregate privacy transformation, Keychain storage and network synchronization with calendar-aware scheduling.
 3. SwiftUI dashboard, native settings, cached history, PNG snapshots and an ad-hoc signed app bundle.
 
-Each stage is committed independently. No push or merge is part of this work.
+Each stage was committed independently before integration.
 
 ## Protocol compatibility
 
