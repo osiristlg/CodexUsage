@@ -20,8 +20,9 @@ public enum LogScanner {
         guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw UsageError.invalid("Session folder does not exist. Choose a readable Codex sessions folder.")
         }
+        var enumerationErrors = 0
         guard let files = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey],
-                                                         options: [.skipsHiddenFiles]) else {
+                                                         options: [.skipsHiddenFiles], errorHandler: { _, _ in enumerationErrors += 1; return true }) else {
             throw UsageError.invalid("Session folder could not be read.")
         }
         var result = ScanResult()
@@ -34,6 +35,7 @@ public enum LogScanner {
             } catch is CancellationError { throw CancellationError() }
             catch { result.unreadableFiles += 1 }
         }
+        result.unreadableFiles += enumerationErrors
         return result
     }
     // Stream by line, retaining only derived points, never a complete log in memory or cache.

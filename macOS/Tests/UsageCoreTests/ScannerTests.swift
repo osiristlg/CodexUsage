@@ -36,6 +36,11 @@ struct ScannerTests {
         expectEqual(SyncWindow.make(now: before, lastFull: before, force: true, calendar: cal).full, true)
         let dst = SyncWindow.make(now: WireTime.date("2026-03-09T07:00:00Z")!, lastFull: nil, force: true, calendar: cal)
         expectEqual(dst.end.timeIntervalSince(dst.start), 30 * 86400 - 3600)
+        // Demonstrate the inherited v1 range/bucket issue without changing receiver semantics.
+        var india = Calendar(identifier: .gregorian); india.timeZone = TimeZone(identifier: "Asia/Kolkata")!
+        let indiaWindow = SyncWindow.make(now: after, lastFull: nil, force: true, calendar: india)
+        let firstBucket = Date(timeIntervalSince1970: floor(indiaWindow.start.timeIntervalSince1970 / 3600) * 3600)
+        expectEqual(firstBucket < indiaWindow.start, true)
         expectThrows(try NetworkClient.endpoint("http://user:pass@host/", path: "api"))
     }
 }
@@ -62,11 +67,15 @@ actor MockReceiver: ExchangeTransport {
 }
 func networkChecks() async throws {
     let receiver = MockReceiver()
-    let initial = NetworkState()
+    var initial = NetworkState()
+    initial.needsFullSync = true
+    initial = try JSONDecoder().decode(NetworkState.self, from: JSONEncoder().encode(initial))
+    expectEqual(initial.needsFullSync, true)
     let result = try await SyncEngine.sync(settings: Settings(), points: [], previous: initial,
         key: Data(repeating: 1, count: 32), force: true, transport: receiver)
     expectEqual(result.combined?.total, 120)
     expectEqual(result.lastFull != nil, true)
+    expectEqual(result.needsFullSync, false)
     await receiver.setReject()
     do {
         _ = try await SyncEngine.sync(settings: Settings(), points: [], previous: initial,

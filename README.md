@@ -6,6 +6,8 @@ Codex Usage is a small desktop dashboard that makes Codex activity easier to und
 
 Version 1.1 can also bring several computers together on your own local network. You can look at this computer, all computers, or one named computer without sending raw logs to the receiver.
 
+The Windows client uses .NET and Windows Forms. A native SwiftUI client for macOS is available in [macOS](macOS/README.md).
+
 ## What it shows
 
 - Today's total token usage, split into input, cached input, output, and reasoning tokens
@@ -107,7 +109,9 @@ dotnet publish -c Release -o .\dist --self-contained false
 
 Launch `Codex Usage.exe` from the resulting `dist` directory.
 
-The macOS client is built from the Xcode project in `macOS/CodexUsage`.
+## macOS client
+
+The native macOS client includes local token totals, selectable 30-day history, hourly model and project breakdowns, Keychain-backed protocol v1 LAN reporting, and private PNG snapshots. Build it with `./macOS/build-app.sh`; see [macOS setup and verification](macOS/README.md) and [compatibility notes](docs/macos-implementation.md).
 
 ## Current status
 

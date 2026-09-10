@@ -4,7 +4,7 @@ import Security
 public struct Settings: Codable, Sendable {
     public var sessionsFolder = LogScanner.defaultFolder.path
     public var refreshSeconds = 60
-    public var receiverURL = "http://127.0.0.1:5099"
+    public var receiverURL = "http://127.0.0.1:4747"
     public var clientId = "mac-" + UUID().uuidString.lowercased()
     public var machineName = Host.current().localizedName ?? "Mac"
     public var reportingEnabled = false
@@ -17,6 +17,7 @@ public struct Settings: Codable, Sendable {
     public var credentialAccount: String { receiverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "|" + clientId }
 }
 public struct NetworkState: Codable, Sendable {
+    public var needsFullSync: Bool?
     public var lastSuccess: Date?
     public var lastFull: Date?
     public var combinedDay: Date?

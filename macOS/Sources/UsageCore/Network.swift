@@ -23,7 +23,7 @@ public enum NetworkClient {
         guard let url = URL(string: base.trimmingCharacters(in: .whitespacesAndNewlines)),
               ["http", "https"].contains(url.scheme), url.host != nil, url.user == nil, url.password == nil,
               url.query == nil, url.fragment == nil, url.path.isEmpty || url.path == "/" else {
-            throw UsageError.invalid("Enter a receiver origin such as http://192.168.1.10:5099.")
+            throw UsageError.invalid("Enter a receiver origin such as http://192.168.1.10:4747.")
         }
         return url.appendingPathComponent(path)
     }
@@ -71,12 +71,12 @@ public enum SyncEngine {
     public static func sync(settings: Settings, points: [UsagePoint], previous: NetworkState, key: Data,
                             force: Bool = false, query: Bool = false, now: Date = Date(),
                             calendar: Calendar = .current, transport: any ExchangeTransport = HTTPTransport()) async throws -> NetworkState {
-        let window = SyncWindow.make(now: now, lastFull: previous.lastFull, force: force, calendar: calendar)
+        let window = SyncWindow.make(now: now, lastFull: previous.lastFull, force: force || previous.needsFullSync == true, calendar: calendar)
         let payload = NetworkClient.payload(settings: settings, points: points, window: window, key: key, query: query)
         let reply = try await NetworkClient.exchange(settings: settings, payload: payload, key: key, now: now, transport: transport)
         var next = previous
         next.lastSuccess = now; next.combinedDay = window.today; next.combined = reply.combined; next.machines = reply.machines
-        if window.full && !query { next.lastFull = window.today }
+        if window.full && !query { next.lastFull = window.today; next.needsFullSync = false }
         return next
     }
 }
