@@ -8,4 +8,9 @@
     <AssemblyName>Codex Usage</AssemblyName>
     <RootNamespace>CodexUsageDashboard</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="src\**\*.cs" />
+    <Compile Remove="tests\**\*.cs" />
+    <ProjectReference Include="src\CodexUsage.Core\CodexUsage.Core.csproj" />
+  </ItemGroup>
 </Project>

@@ -4,6 +4,8 @@ using System.Drawing.Imaging;
 using System.Globalization;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using CodexUsage.Core;
 
 namespace CodexUsageDashboard;
 
@@ -110,6 +112,39 @@ internal static class LogScanner
                     .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours);
             }).ToArray();
         return new HistoryCache(DateTime.Now, result);
+    }, token);
+
+    public static Task<IReadOnlyList<AggregateRow>> ScanAggregatesAsync(
+        DateTime rangeStartUtc, DateTime rangeEndUtc, CancellationToken token, string? sessionsPath = null) => Task.Run(() =>
+    {
+        if (rangeStartUtc.Kind != DateTimeKind.Utc || rangeEndUtc.Kind != DateTimeKind.Utc || rangeEndUtc <= rangeStartUtc)
+            throw new ArgumentException("Aggregate scan range must be a valid UTC interval.");
+        var sourcePath = ResolveSessionsPath(sessionsPath);
+        var files = Directory.Exists(sourcePath)
+            ? Directory.EnumerateFiles(sourcePath, "*.jsonl", SearchOption.AllDirectories).ToArray()
+            : [];
+        var points = new List<UsagePoint>();
+        var localStart = rangeStartUtc.ToLocalTime().Date;
+        var localEnd = rangeEndUtc.AddTicks(-1).ToLocalTime().Date;
+        foreach (var file in files)
+        {
+            token.ThrowIfCancellationRequested();
+            ScanFile(file, localStart, localEnd, points, token);
+        }
+        return (IReadOnlyList<AggregateRow>)points
+            .Where(point => point.Time.ToUniversalTime() >= rangeStartUtc && point.Time.ToUniversalTime() < rangeEndUtc)
+            .GroupBy(point => new
+            {
+                Bucket = new DateTime(point.Time.ToUniversalTime().Year, point.Time.ToUniversalTime().Month,
+                    point.Time.ToUniversalTime().Day, point.Time.ToUniversalTime().Hour, 0, 0, DateTimeKind.Utc),
+                point.Model,
+                point.Project
+            })
+            .Select(group => new AggregateRow(group.Key.Bucket, group.Key.Model, group.Key.Project,
+                new TokenCounts(group.Sum(p => p.Input), group.Sum(p => p.Cached), group.Sum(p => p.Output),
+                    group.Sum(p => p.Reasoning), group.LongCount())))
+            .OrderBy(row => row.BucketStartUtc).ThenBy(row => row.Project).ThenBy(row => row.Model)
+            .ToArray();
     }, token);
 
     private static UsageSnapshot ScanToday(CancellationToken token, string sessionsPath)
@@ -333,7 +368,14 @@ internal sealed record DashboardSettings(
     int SnapshotMinutes = 15,
     string SnapshotFolder = "",
     bool HideProjectNames = true,
-    string SessionsFolder = "");
+    string SessionsFolder = "",
+    bool NetworkEnabled = false,
+    string ReceiverUrl = "http://127.0.0.1:4747",
+    string MachineName = "",
+    string ClientId = "",
+    string NetworkSalt = "",
+    string ProtectedNetworkKey = "",
+    string NetworkProjectMode = "anonymous");
 
 internal static class SettingsStore
 {
@@ -383,11 +425,13 @@ internal sealed class DashboardForm : Form
     private CancellationTokenSource? refreshCts;
     private bool isRefreshing;
     private bool isRebuilding;
+    private bool isNetworkSyncing;
     private int refreshMinutes = 5;
     private DateTime? lastRefreshedAt;
     private Panel header = null!;
     private Label titleLabel = null!;
     private DashboardSettings appSettings = new();
+    private NetworkSyncState networkState = NetworkReporter.LoadState();
 
     public DashboardForm()
     {
@@ -397,6 +441,15 @@ internal sealed class DashboardForm : Form
         if (string.IsNullOrWhiteSpace(appSettings.SessionsFolder))
         {
             appSettings = appSettings with { SessionsFolder = LogScanner.DefaultSessionsPath };
+            SettingsStore.Save(appSettings);
+        }
+        if (string.IsNullOrWhiteSpace(appSettings.MachineName) || string.IsNullOrWhiteSpace(appSettings.ClientId))
+        {
+            appSettings = appSettings with
+            {
+                MachineName = string.IsNullOrWhiteSpace(appSettings.MachineName) ? Environment.MachineName : appSettings.MachineName,
+                ClientId = string.IsNullOrWhiteSpace(appSettings.ClientId) ? Guid.NewGuid().ToString("N") : appSettings.ClientId
+            };
             SettingsStore.Save(appSettings);
         }
         ThemeCatalog.Select(appSettings.Theme);
@@ -442,7 +495,7 @@ internal sealed class DashboardForm : Form
 
         refresh.Click += async (_, _) => await RefreshDataAsync();
         rebuild.Click += async (_, _) => await RebuildHistoryAsync();
-        settings.Click += (_, _) => ShowSettingsMenu();
+        settings.Click += async (_, _) => await ShowSettingsDialogAsync();
         timer.Tick += async (_, _) => await RefreshDataAsync();
         snapshotTimer.Tick += (_, _) => ExportSnapshot();
         Shown += async (_, _) =>
@@ -452,6 +505,7 @@ internal sealed class DashboardForm : Form
             if (appSettings.SnapshotEnabled) ExportSnapshot();
         };
         FormClosed += (_, _) => { refreshCts?.Cancel(); snapshotTimer.Stop(); };
+        canvas.NetworkState = networkState;
         ApplyTheme();
     }
 
@@ -478,6 +532,7 @@ internal sealed class DashboardForm : Form
             lastRefreshedAt = snapshot.RefreshedAt;
             UpdateRefreshStatus();
             if (HistoryStore.ShouldAutoBuild(canvas.History)) await RebuildHistoryAsync(true);
+            await SyncNetworkAsync(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -629,6 +684,32 @@ internal sealed class DashboardForm : Form
         menu.Show(settings, new Point(settings.Width - menu.PreferredSize.Width, settings.Height + 2));
     }
 
+    private async Task ShowSettingsDialogAsync()
+    {
+        var previous = appSettings;
+        using var dialog = new SettingsDialog(appSettings);
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+        appSettings = dialog.Result;
+        SettingsStore.Save(appSettings);
+        refreshMinutes = Math.Clamp(appSettings.RefreshMinutes, 1, 120);
+        timer.Stop();
+        timer.Interval = refreshMinutes * 60 * 1000;
+        timer.Start();
+        ThemeCatalog.Select(appSettings.Theme);
+        ConfigureSnapshotTimer();
+        ApplyTheme();
+        UpdateRefreshStatus();
+
+        if (!string.Equals(previous.SessionsFolder, appSettings.SessionsFolder, StringComparison.OrdinalIgnoreCase))
+        {
+            await RebuildHistoryAsync();
+            await RefreshDataAsync();
+        }
+        if (appSettings.SnapshotEnabled) ExportSnapshot();
+        await SyncNetworkAsync(false);
+    }
+
     private bool ChooseSessionsFolder()
     {
         using var dialog = new FolderBrowserDialog
@@ -697,6 +778,20 @@ internal sealed class DashboardForm : Form
         }
     }
 
+    private async Task SyncNetworkAsync(bool forceFull)
+    {
+        if (!appSettings.NetworkEnabled || string.IsNullOrWhiteSpace(appSettings.ProtectedNetworkKey) || isNetworkSyncing) return;
+        isNetworkSyncing = true;
+        try
+        {
+            networkState = await NetworkReporter.SyncAsync(appSettings, forceFull, refreshCts?.Token ?? CancellationToken.None);
+            canvas.NetworkState = networkState;
+            canvas.Invalidate();
+            if (forceFull) status.Text = networkState.LastStatus;
+        }
+        finally { isNetworkSyncing = false; }
+    }
+
     private void ApplyTheme()
     {
         BackColor = Bg;
@@ -718,9 +813,658 @@ internal sealed class DashboardForm : Form
             : $"Refresh every {refreshMinutes} min";
     }
 
+    private sealed class SettingsDialog : Form
+    {
+        private readonly Panel pageHost = new() { Dock = DockStyle.Fill, Padding = new Padding(38, 26, 38, 24) };
+        private readonly List<Button> navigation = [];
+        private readonly NeonSelect refresh = MakeCombo();
+        private readonly NeonSelect theme = MakeCombo();
+        private readonly PathDisplay sessions = MakePathDisplay();
+        private readonly NeonToggle snapshotEnabled = new();
+        private readonly PathDisplay snapshotFolder = MakePathDisplay();
+        private readonly NeonSelect snapshotInterval = MakeCombo();
+        private readonly NeonToggle hideProjects = new();
+        private readonly NeonToggle networkEnabled = new();
+        private readonly TextBox clientId = MakeInput();
+        private readonly TextBox receiverUrl = MakeInput();
+        private readonly TextBox machineName = MakeInput();
+        private readonly TextBox passphrase = MakeInput(true);
+        private readonly NeonSelect networkProjects = MakeCombo();
+        private readonly Label networkStatus = MakeLabel("Not tested", 9f, Theme.Muted);
+        private int selectedPage;
+
+        public DashboardSettings Result { get; private set; }
+
+        public SettingsDialog(DashboardSettings settings)
+        {
+            Result = settings;
+            Text = "Codex Usage Settings";
+            Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            Size = new Size(980, 680);
+            MinimumSize = new Size(900, 620);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.None;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            BackColor = Theme.Background;
+            ForeColor = Theme.Text;
+            Font = new Font("Segoe UI", 9.5f);
+            DoubleBuffered = true;
+            Padding = new Padding(2);
+
+            var header = new Panel { Dock = DockStyle.Top, Height = 78, BackColor = Shade(Theme.Background, 3) };
+            var eyebrow = MakeLabel("CODEX  /  CONTROL DECK", 9f, Theme.Tertiary, FontStyle.Bold);
+            eyebrow.Location = new Point(28, 15);
+            var heading = MakeLabel("Settings", 22f, Theme.Text, FontStyle.Bold);
+            heading.Location = new Point(25, 32);
+            var close = CompactButton("×", Theme.Secondary);
+            close.Size = new Size(48, 44);
+            close.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
+            header.Controls.AddRange([eyebrow, heading, close]);
+            void LayoutHeader() => close.Location = new Point(header.ClientSize.Width - close.Width - 18, 16);
+            header.Resize += (_, _) => LayoutHeader();
+            LayoutHeader();
+            header.MouseDown += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left) return;
+                ReleaseCapture();
+                SendMessage(Handle, 0xA1, 0x2, 0);
+            };
+
+            var footer = new Panel { Dock = DockStyle.Bottom, Height = 78, BackColor = Shade(Theme.Background, 3) };
+            var cancel = DialogButton("Cancel", Theme.Muted, 104);
+            cancel.DialogResult = DialogResult.Cancel;
+            var save = DialogButton("Save changes", Theme.Primary, 138);
+            save.Click += async (_, _) => await SaveAndCloseAsync();
+            footer.Controls.AddRange([cancel, save]);
+            void LayoutFooter()
+            {
+                save.Location = new Point(footer.ClientSize.Width - save.Width - 28, 18);
+                cancel.Location = new Point(save.Left - cancel.Width - 10, 18);
+            }
+            footer.Resize += (_, _) => LayoutFooter();
+            LayoutFooter();
+
+            var rail = new Panel { Dock = DockStyle.Left, Width = 230, Padding = new Padding(18, 24, 18, 18), BackColor = Shade(Theme.Panel, -5) };
+            AddNavigation(rail, "◫   Dashboard", 0);
+            AddNavigation(rail, "⌂   Codex Data", 1);
+            AddNavigation(rail, "▣   Snapshot Export", 2);
+            AddNavigation(rail, "⌁   Network Reporting", 3);
+
+            pageHost.BackColor = Theme.Background;
+            Controls.Add(pageHost);
+            Controls.Add(rail);
+            Controls.Add(footer);
+            Controls.Add(header);
+            AcceptButton = save;
+            CancelButton = cancel;
+
+            foreach (var value in new[] { 1, 2, 5, 10, 15, 30, 60 }) refresh.Items.Add(value);
+            refresh.SelectedItem = settings.RefreshMinutes;
+            foreach (var palette in ThemeCatalog.All) theme.Items.Add(palette.Name);
+            theme.SelectedItem = settings.Theme;
+            sessions.Text = string.IsNullOrWhiteSpace(settings.SessionsFolder) ? LogScanner.DefaultSessionsPath : settings.SessionsFolder;
+            snapshotEnabled.Checked = settings.SnapshotEnabled;
+            snapshotFolder.Text = settings.SnapshotFolder;
+            foreach (var value in new[] { 5, 15, 30, 60 }) snapshotInterval.Items.Add(value);
+            snapshotInterval.SelectedItem = settings.SnapshotMinutes;
+            hideProjects.Checked = settings.HideProjectNames;
+            networkEnabled.Checked = settings.NetworkEnabled;
+            clientId.Text = settings.ClientId;
+            clientId.ReadOnly = true;
+            clientId.BackColor = Shade(Theme.Panel, 7);
+            receiverUrl.Text = settings.ReceiverUrl;
+            machineName.Text = settings.MachineName;
+            foreach (var value in new[] { "Anonymous project IDs", "Project names", "No project breakdown" }) networkProjects.Items.Add(value);
+            networkProjects.SelectedItem = settings.NetworkProjectMode switch
+            {
+                "names" => "Project names",
+                "none" => "No project breakdown",
+                _ => "Anonymous project IDs"
+            };
+            networkStatus.Text = NetworkReporter.LoadState().LastStatus;
+            ShowPage(0);
+        }
+
+        private void AddNavigation(Panel rail, string text, int index)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Location = new Point(18, 24 + index * 58),
+                Width = 194,
+                Height = 58,
+                FlatStyle = FlatStyle.Flat,
+                FlatAppearance = { BorderSize = 0 },
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(15, 0, 0, 0),
+                BackColor = Color.Transparent,
+                ForeColor = Theme.Muted,
+                Font = new Font("Segoe UI Semibold", 10f),
+                Cursor = Cursors.Hand,
+                Tag = index
+            };
+            button.Click += (_, _) => ShowPage((int)button.Tag!);
+            navigation.Add(button);
+            rail.Controls.Add(button);
+        }
+
+        private void ShowPage(int index)
+        {
+            selectedPage = index;
+            for (var i = 0; i < navigation.Count; i++)
+            {
+                navigation[i].BackColor = i == index ? Color.FromArgb(36, Theme.Primary) : Color.Transparent;
+                navigation[i].ForeColor = i == index ? Theme.Text : Theme.Muted;
+            }
+            pageHost.Controls.Clear();
+            pageHost.Controls.Add(index switch
+            {
+                0 => DashboardPage(),
+                1 => DataPage(),
+                2 => SnapshotPage(),
+                _ => NetworkPage()
+            });
+        }
+
+        private Control DashboardPage()
+        {
+            var page = NewPage("Dashboard", "Tune the live experience without leaving the cockpit.");
+            page.Controls.Add(SettingCard("COLOR SCHEME", "Choose the visual atmosphere.", theme));
+            page.Controls.Add(SettingCard("REFRESH INTERVAL", "How often local session logs are rescanned.", refresh, "minutes"));
+            return page;
+        }
+
+        private Control DataPage()
+        {
+            var page = NewPage("Codex Data", "Control where local usage is discovered.");
+            var browse = CompactButton("Browse…", Theme.Secondary);
+            browse.Click += (_, _) => PickFolder(sessions, "Choose the Codex sessions folder", false, LogScanner.DefaultSessionsPath);
+            page.Controls.Add(PathSettingCard("SESSION LOG LOCATION", "Resolved from your home directory by default. No username is hard-coded.", sessions, browse));
+            return page;
+        }
+
+        private Control SnapshotPage()
+        {
+            var page = NewPage("Snapshot Export", "Keep one fresh dashboard image wherever you need it.");
+            var browse = CompactButton("Browse…", Theme.Secondary);
+            browse.Click += (_, _) => PickFolder(snapshotFolder, "Choose a snapshot destination", true,
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
+            page.Controls.Add(SettingCard("LATEST SNAPSHOT", "Export codex-usage-latest.png automatically.", snapshotEnabled));
+            page.Controls.Add(PathSettingCard("DESTINATION", "Local or user-managed synchronized folder.", snapshotFolder, browse));
+            page.Controls.Add(SettingCard("CAPTURE INTERVAL", "The latest PNG replaces the previous capture.", snapshotInterval, "minutes"));
+            page.Controls.Add(SettingCard("PROJECT PRIVACY", "Replace project names with anonymous labels in exported images.", hideProjects));
+            return page;
+        }
+
+        private Control NetworkPage()
+        {
+            var page = NewPage("Network Reporting", "Encrypted aggregate reporting across your private network.");
+            var card = new Panel { Width = 630, Height = 356, BackColor = Shade(Theme.Panel, 2), Padding = new Padding(24) };
+            var badge = MakeLabel("AGGREGATES ONLY  /  RAW LOGS NEVER LEAVE THIS MACHINE", 8.5f, Theme.Tertiary, FontStyle.Bold);
+            badge.Location = new Point(22, 18);
+            AddNetworkRow(card, "REPORT TO RECEIVER", networkEnabled, 44);
+            clientId.Width = 330;
+            AddNetworkRow(card, "CLIENT ID  /  COPY TO RECEIVER", clientId, 84);
+            receiverUrl.Width = 330;
+            AddNetworkRow(card, "RECEIVER ADDRESS", receiverUrl, 124);
+            machineName.Width = 220;
+            AddNetworkRow(card, "MACHINE NAME", machineName, 164);
+            passphrase.Width = 220;
+            AddNetworkRow(card, "SHARED PASSPHRASE", passphrase, 204, "Leave blank to keep the configured key");
+            networkProjects.Width = 220;
+            AddNetworkRow(card, "PROJECT DETAIL", networkProjects, 252);
+            var test = CompactButton("Test connection", Theme.Secondary);
+            test.Size = new Size(132, 40);
+            test.Location = new Point(20, 300);
+            test.Click += async (_, _) => await TestConnectionAsync(test);
+            networkStatus.Location = new Point(166, 310);
+            networkStatus.MaximumSize = new Size(430, 36);
+            card.Controls.AddRange([badge, test, networkStatus]);
+            page.Controls.Add(card);
+            return page;
+        }
+
+        private static void AddNetworkRow(Panel card, string label, Control input, int y, string? hint = null)
+        {
+            var labelControl = MakeLabel(label, 8.5f, Theme.Muted, FontStyle.Bold);
+            labelControl.Location = new Point(20, y + 8);
+            input.Location = new Point(255, y);
+            card.Controls.AddRange([labelControl, input]);
+            if (hint is null) return;
+            var hintControl = MakeLabel(hint, 8f, Theme.Muted);
+            hintControl.Location = new Point(255, y + 31);
+            card.Controls.Add(hintControl);
+        }
+
+        private async Task TestConnectionAsync(Control button)
+        {
+            button.Enabled = false;
+            networkStatus.ForeColor = Theme.Muted;
+            networkStatus.Text = "Testing encrypted exchange…";
+            try
+            {
+                Result = BuildResult();
+                if (!string.IsNullOrWhiteSpace(passphrase.Text))
+                    Result = await NetworkReporter.ConfigurePassphraseAsync(Result, passphrase.Text, CancellationToken.None);
+                var state = await NetworkReporter.TestAsync(Result, CancellationToken.None);
+                var success = state.LastStatus == "Encrypted connection verified";
+                networkStatus.ForeColor = success ? Theme.Primary : Theme.Secondary;
+                networkStatus.Text = success ? "Encrypted connection verified" : state.LastStatus;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidDataException or CryptographicException or
+                                          FormatException or UriFormatException or TaskCanceledException)
+            {
+                networkStatus.ForeColor = Theme.Secondary;
+                networkStatus.Text = ex.Message;
+            }
+            finally { button.Enabled = true; }
+        }
+
+        private FlowLayoutPanel NewPage(string title, string subtitle)
+        {
+            var page = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                AutoScroll = false,
+                BackColor = Theme.Background,
+                Padding = new Padding(0)
+            };
+            var titleLabel = MakeLabel(title, 24f, Theme.Text, FontStyle.Bold);
+            titleLabel.Margin = new Padding(0, 0, 0, 2);
+            var subtitleLabel = MakeLabel(subtitle, 10f, Theme.Muted);
+            subtitleLabel.Margin = new Padding(2, 0, 0, 18);
+            page.Controls.Add(titleLabel);
+            page.Controls.Add(subtitleLabel);
+            return page;
+        }
+
+        private Panel SettingCard(string title, string description, Control input, string? suffix = null, Control? action = null)
+        {
+            var card = new Panel { Width = 630, Height = 78, BackColor = Shade(Theme.Panel, 2), Margin = new Padding(0, 0, 0, 8) };
+            var titleLabel = MakeLabel(title, 8.5f, Theme.Tertiary, FontStyle.Bold);
+            titleLabel.Location = new Point(20, 11);
+            var descriptionLabel = MakeLabel(description, 9f, Theme.Muted);
+            descriptionLabel.Location = new Point(20, 35);
+            descriptionLabel.MaximumSize = new Size(350, 38);
+            card.Controls.AddRange([titleLabel, descriptionLabel]);
+            input.Location = new Point(425, 22);
+            card.Controls.Add(input);
+            if (suffix is not null)
+            {
+                var suffixLabel = MakeLabel(suffix, 9f, Theme.Muted);
+                suffixLabel.Location = new Point(input.Right + 8, 29);
+                card.Controls.Add(suffixLabel);
+            }
+            if (action is not null)
+            {
+                action.Location = new Point(560, 27);
+                card.Controls.Add(action);
+            }
+            return card;
+        }
+
+        private Panel PathSettingCard(string title, string description, PathDisplay path, Control action)
+        {
+            var card = new Panel { Width = 630, Height = 126, BackColor = Shade(Theme.Panel, 2), Margin = new Padding(0, 0, 0, 8) };
+            var titleLabel = MakeLabel(title, 8.5f, Theme.Tertiary, FontStyle.Bold);
+            titleLabel.Location = new Point(20, 11);
+            var descriptionLabel = MakeLabel(description, 9f, Theme.Muted);
+            descriptionLabel.Location = new Point(20, 35);
+            path.Location = new Point(20, 58);
+            path.Size = new Size(590, 25);
+            action.Location = new Point(20, 87);
+            action.Size = new Size(96, 35);
+            card.Controls.AddRange([titleLabel, descriptionLabel, path, action]);
+            return card;
+        }
+
+        private void PickFolder(PathDisplay target, string description, bool allowNew, string fallback)
+        {
+            using var dialog = new FolderBrowserDialog
+            {
+                Description = description,
+                UseDescriptionForTitle = true,
+                ShowNewFolderButton = allowNew,
+                InitialDirectory = Directory.Exists(target.Text) ? target.Text : fallback
+            };
+            if (dialog.ShowDialog(this) == DialogResult.OK) target.Text = dialog.SelectedPath;
+        }
+
+        private async Task SaveAndCloseAsync()
+        {
+            if (string.IsNullOrWhiteSpace(sessions.Text) || !Directory.Exists(sessions.Text))
+            {
+                ShowPage(1);
+                MessageBox.Show(this, "Choose an existing Codex sessions folder.", "Codex Usage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (snapshotEnabled.Checked && string.IsNullOrWhiteSpace(snapshotFolder.Text))
+            {
+                ShowPage(2);
+                MessageBox.Show(this, "Choose a snapshot destination or turn snapshot export off.", "Codex Usage", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            try
+            {
+                Result = BuildResult();
+                if (!string.IsNullOrWhiteSpace(passphrase.Text))
+                    Result = await NetworkReporter.ConfigurePassphraseAsync(Result, passphrase.Text, CancellationToken.None);
+                if (Result.NetworkEnabled && string.IsNullOrWhiteSpace(Result.ProtectedNetworkKey))
+                {
+                    ShowPage(3);
+                    networkStatus.ForeColor = Theme.Secondary;
+                    networkStatus.Text = "Set the shared passphrase before enabling reporting.";
+                    return;
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidDataException or CryptographicException or
+                                          FormatException or UriFormatException or TaskCanceledException)
+            {
+                ShowPage(3);
+                networkStatus.ForeColor = Theme.Secondary;
+                networkStatus.Text = ex.Message;
+                return;
+            }
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+
+        private DashboardSettings BuildResult()
+        {
+            if (!Uri.TryCreate(receiverUrl.Text.Trim(), UriKind.Absolute, out var receiver) || receiver.Scheme != Uri.UriSchemeHttp)
+                throw new UriFormatException("Receiver address must be an http:// LAN address.");
+            if (string.IsNullOrWhiteSpace(machineName.Text)) throw new InvalidDataException("Machine name is required.");
+            return Result with
+            {
+                RefreshMinutes = refresh.SelectedItem is int refreshValue ? refreshValue : 5,
+                Theme = theme.SelectedItem?.ToString() ?? ThemeCatalog.All[0].Name,
+                SessionsFolder = Path.GetFullPath(sessions.Text),
+                SnapshotEnabled = snapshotEnabled.Checked,
+                SnapshotFolder = string.IsNullOrWhiteSpace(snapshotFolder.Text) ? "" : Path.GetFullPath(snapshotFolder.Text),
+                SnapshotMinutes = snapshotInterval.SelectedItem is int snapshotValue ? snapshotValue : 15,
+                HideProjectNames = hideProjects.Checked,
+                NetworkEnabled = networkEnabled.Checked,
+                ReceiverUrl = receiver.ToString().TrimEnd('/'),
+                MachineName = machineName.Text.Trim(),
+                NetworkProjectMode = networkProjects.SelectedItem?.ToString() switch
+                {
+                    "Project names" => "names",
+                    "No project breakdown" => "none",
+                    _ => "anonymous"
+                }
+            };
+        }
+
+        private static NeonSelect MakeCombo() => new()
+        {
+            Width = 150,
+            Height = 34,
+            ForeColor = Theme.Text,
+            Font = new Font("Segoe UI Semibold", 9.5f)
+        };
+
+        private static PathDisplay MakePathDisplay() => new()
+        {
+            AutoEllipsis = true,
+            BackColor = Color.Transparent,
+            ForeColor = Theme.Text,
+            Font = new Font("Cascadia Mono", 9f),
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+
+        private static TextBox MakeInput(bool secret = false) => new()
+        {
+            Height = 30,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = Shade(Theme.Panel, 10),
+            ForeColor = Theme.Text,
+            Font = new Font(secret ? "Segoe UI" : "Cascadia Mono", 9f),
+            UseSystemPasswordChar = secret
+        };
+
+        private static Label MakeLabel(string text, float size, Color color, FontStyle style = FontStyle.Regular) => new()
+        {
+            Text = text,
+            AutoSize = true,
+            ForeColor = color,
+            Font = new Font("Segoe UI", size, style),
+            BackColor = Color.Transparent
+        };
+
+        private static Button CompactButton(string text, Color accent) => new NeonButton(accent)
+        {
+            Text = text,
+            Width = 88,
+            Height = 40,
+            ForeColor = Theme.Text,
+            Font = new Font("Segoe UI Semibold", 8.5f),
+            Cursor = Cursors.Hand
+        };
+
+        private static Button DialogButton(string text, Color accent, int width) => new NeonButton(accent)
+        {
+            Text = text,
+            Width = width,
+            Height = 46,
+            ForeColor = Theme.Text,
+            Font = new Font("Segoe UI Semibold", 9.5f),
+            Cursor = Cursors.Hand
+        };
+
+        private static Color Shade(Color color, int amount) => Color.FromArgb(color.A,
+            Math.Clamp(color.R + amount, 0, 255), Math.Clamp(color.G + amount, 0, 255), Math.Clamp(color.B + amount, 0, 255));
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using var glow = new Pen(Color.FromArgb(70, Theme.Primary), 6f);
+            using var edge = new Pen(Color.FromArgb(235, Theme.Primary), 1.5f);
+            var bounds = new Rectangle(2, 2, ClientSize.Width - 5, ClientSize.Height - 5);
+            e.Graphics.DrawRectangle(glow, bounds);
+            e.Graphics.DrawRectangle(edge, bounds);
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        private static extern nint SendMessage(nint hWnd, int message, int wParam, int lParam);
+    }
+
+    private sealed class PathDisplay : Label
+    {
+        private readonly ToolTip tip = new() { InitialDelay = 350, ReshowDelay = 100 };
+
+        protected override void OnTextChanged(EventArgs e)
+        {
+            base.OnTextChanged(e);
+            tip.SetToolTip(this, Text);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) tip.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class NeonSelect : Control
+    {
+        private object? selectedItem;
+        private bool hovering;
+        private ContextMenuStrip? choicesMenu;
+
+        public List<object> Items { get; } = [];
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public object? SelectedItem
+        {
+            get => selectedItem;
+            set { selectedItem = value; Invalidate(); }
+        }
+
+        public NeonSelect()
+        {
+            Cursor = Cursors.Hand;
+            TabStop = true;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hovering = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        protected override void OnClick(EventArgs e) { base.OnClick(e); ShowChoices(); }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode is Keys.Enter or Keys.Space or Keys.Down)
+            {
+                ShowChoices();
+                e.Handled = true;
+            }
+            base.OnKeyDown(e);
+        }
+
+        private void ShowChoices()
+        {
+            if (choicesMenu is null)
+            {
+                choicesMenu = new ContextMenuStrip
+                {
+                    BackColor = Theme.Panel,
+                    ForeColor = Theme.Text,
+                    Font = Font,
+                    ShowImageMargin = false,
+                    Renderer = new NightCityMenuRenderer()
+                };
+                foreach (var choice in Items)
+                {
+                    var item = new ToolStripMenuItem(choice.ToString())
+                    {
+                        Tag = choice,
+                        Padding = new Padding(10, 5, 18, 5)
+                    };
+                    item.Click += (_, _) => SelectedItem = item.Tag;
+                    choicesMenu.Items.Add(item);
+                }
+            }
+            foreach (ToolStripMenuItem item in choicesMenu.Items)
+            {
+                var current = Equals(item.Tag, SelectedItem);
+                item.ForeColor = current ? Theme.Primary : Theme.Text;
+            }
+            choicesMenu.Show(this, new Point(0, Height + 3));
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) choicesMenu?.Dispose();
+            base.Dispose(disposing);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var bounds = new Rectangle(2, 3, Width - 5, Height - 7);
+            using var path = Rounded(bounds, 7);
+            using var fill = new LinearGradientBrush(bounds, Shade(Theme.Panel, 13), Shade(Theme.Panel, 3), 90f);
+            using var glow = new Pen(Color.FromArgb(hovering || Focused ? 95 : 40, Theme.Primary), hovering || Focused ? 5f : 3f);
+            using var edge = new Pen(Color.FromArgb(hovering || Focused ? 240 : 165, Theme.Primary), 1.2f);
+            e.Graphics.FillPath(fill, path);
+            e.Graphics.DrawPath(glow, path);
+            e.Graphics.DrawPath(edge, path);
+            var textBounds = new Rectangle(13, 0, Width - 43, Height);
+            TextRenderer.DrawText(e.Graphics, SelectedItem?.ToString() ?? "Select…", Font, textBounds, Theme.Text,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            var cx = Width - 19;
+            var cy = Height / 2 + 1;
+            using var arrow = new Pen(Theme.Primary, 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            e.Graphics.DrawLine(arrow, cx - 4, cy - 2, cx, cy + 2);
+            e.Graphics.DrawLine(arrow, cx, cy + 2, cx + 4, cy - 2);
+        }
+
+        private static GraphicsPath Rounded(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+            var d = radius * 2;
+            path.AddArc(r.Left, r.Top, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        private static Color Shade(Color color, int amount) => Color.FromArgb(color.A,
+            Math.Clamp(color.R + amount, 0, 255), Math.Clamp(color.G + amount, 0, 255), Math.Clamp(color.B + amount, 0, 255));
+    }
+
+    private sealed class NeonToggle : CheckBox
+    {
+        public NeonToggle()
+        {
+            AutoSize = false;
+            Size = new Size(58, 30);
+            Cursor = Cursors.Hand;
+            Text = "";
+            UseVisualStyleBackColor = false;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
+                ControlStyles.Opaque, true);
+        }
+
+        protected override void OnParentChanged(EventArgs e)
+        {
+            base.OnParentChanged(e);
+            if (Parent is not null) BackColor = Parent.BackColor;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.Clear(Parent?.BackColor ?? Theme.Panel);
+            var track = new Rectangle(2, 4, Width - 4, Height - 8);
+            using var path = RoundedRect(track, track.Height / 2);
+            using var fill = new SolidBrush(Checked ? Color.FromArgb(115, Theme.Primary) : Color.FromArgb(65, Theme.Muted));
+            using var edge = new Pen(Checked ? Theme.Primary : Theme.Muted, 1.2f);
+            e.Graphics.FillPath(fill, path);
+            e.Graphics.DrawPath(edge, path);
+            var diameter = track.Height - 6;
+            var x = Checked ? track.Right - diameter - 3 : track.Left + 3;
+            using var knob = new SolidBrush(Checked ? Color.White : Color.FromArgb(205, Theme.Muted));
+            e.Graphics.FillEllipse(knob, x, track.Top + 3, diameter, diameter);
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+            var d = radius * 2;
+            path.AddArc(r.Left, r.Top, d, d, 90, 180);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 180);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
     private sealed class NightCityMenuRenderer : ToolStripProfessionalRenderer
     {
         public NightCityMenuRenderer() : base(new NightCityColorTable()) { RoundedEdges = true; }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            var bounds = new Rectangle(Point.Empty, e.Item.Size);
+            using var fill = new SolidBrush(e.Item.Selected ? Color.FromArgb(82, Theme.Primary) : Theme.Panel);
+            e.Graphics.FillRectangle(fill, bounds);
+            if (e.Item.Selected)
+            {
+                using var edge = new Pen(Color.FromArgb(210, Theme.Primary), 1f);
+                e.Graphics.DrawRectangle(edge, 0, 0, Math.Max(0, bounds.Width - 1), Math.Max(0, bounds.Height - 1));
+            }
+        }
     }
 
     private sealed class NightCityColorTable : ProfessionalColorTable
@@ -750,6 +1494,7 @@ internal sealed class DashboardForm : Form
             canvas.History = history;
             canvas.Invalidate();
             status.Text = $"30-day history built {history.BuiltAt:h:mm tt}";
+            await SyncNetworkAsync(true);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -841,6 +1586,9 @@ internal sealed class DashboardForm : Form
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public HistoryCache? History { get; set; }
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public NetworkSyncState? NetworkState { get; set; }
 
         public UsageCanvas()
         {
@@ -964,13 +1712,13 @@ internal sealed class DashboardForm : Form
             StrokeRound(g, chart, 22, Color.FromArgb(45, Theme.Primary));
             StrokeRound(g, projects, 22, Color.FromArgb(45, Theme.Tertiary));
             StrokeRound(g, history, 22, Color.FromArgb(45, Theme.Secondary));
-            DrawHero(g, hero, Snapshot);
+            DrawHero(g, hero, Snapshot, NetworkState);
             DrawChart(g, chart, Snapshot, History, pinnedDate);
             DrawProjects(g, projects, Snapshot, History, hoveredDate, hoveredHour, pinnedDate, hideProjectNames);
             DrawHistory(g, history, History);
         }
 
-        private static void DrawHero(Graphics g, Rectangle r, UsageSnapshot s)
+        private static void DrawHero(Graphics g, Rectangle r, UsageSnapshot s, NetworkSyncState? network)
         {
             using var label = new Font("Segoe UI Semibold", 10f);
             using var value = new Font("Segoe UI Variable Display", 37f, FontStyle.Bold);
@@ -994,6 +1742,12 @@ internal sealed class DashboardForm : Form
                 using var metric = new Font("Segoe UI Variable Display Semibold", 19f);
                 g.DrawString(Compact(item.Item2), metric, new SolidBrush(TextMain), x, r.Y + 82);
                 x += width;
+            }
+            if (network?.Combined is { } combined && network.LastSuccessUtc is { } received)
+            {
+                using var global = new Font("Segoe UI Semibold", 9f);
+                g.DrawString($"ALL MACHINES  {Compact(combined.Total)}  ·  synced {received.ToLocalTime():h:mm tt}", global,
+                    new SolidBrush(Theme.Tertiary), r.X + 29, r.Bottom - 61);
             }
             g.DrawString($"{s.Points.Count:N0} responses across {s.FilesScanned:N0} log files", small,
                 new SolidBrush(TextMuted), r.X + 29, r.Bottom - 38);

@@ -12,6 +12,7 @@ The current client is built for Windows with .NET and Windows Forms.
 - An interactive rolling 30-day history
 - Historical hourly and project breakdowns
 - Automatic refresh, with a configurable interval
+- Optional encrypted, aggregate-only reporting across machines on the same LAN
 - Several built-in visual themes
 
 Hover over the charts for more detail. Select a day in the 30-day chart to inspect it, and use **Rebuild 30 days** when you want to rescan the local history immediately.
@@ -41,15 +42,31 @@ Codex Usage currently reads session data from the signed-in user's standard Code
 
 The session directory is configurable from **Settings → Codex Data → Choose session folder**. Its initial value is derived at runtime from the current user's operating-system home directory, so the application does not contain a hard-coded username or machine-specific path. The selected location persists across application restarts.
 
-It does not modify those logs or send them anywhere. Dashboard settings and the derived 30-day cache are stored under:
+It does not modify those logs. Unless you explicitly enable LAN reporting, it does not send usage data anywhere. Dashboard settings and the derived 30-day cache are stored under:
 
 ```text
 %LOCALAPPDATA%\Codex Usage
 ```
 
-Project names are derived from the working directories recorded in the session logs. They remain local unless you deliberately place an exported snapshot in a shared location. The snapshot privacy option can replace those names with generic labels.
+Project names are derived from the working directories recorded in the session logs. They remain local unless you deliberately place an exported snapshot in a shared location or choose **Project names** for LAN reporting. Snapshot export can replace names with generic labels. LAN reporting defaults to stable anonymous project IDs and can instead omit the project breakdown entirely.
 
-Future multi-machine reporting will transmit only derived, aggregated usage statistics. Raw Codex session logs, prompts, responses, and other session contents will remain on the machine where they were created. Raw-log shipping is not planned: the central receiver does not need those records and will not accept them.
+LAN reporting transmits only hourly token counts grouped by model and, depending on your privacy setting, project. Raw Codex logs, prompts, responses, filenames, and paths remain on the machine where they were created. The receiver has no endpoint for raw-log upload. See [LAN reporting](docs/lan-reporting.md) for setup and security details.
+
+## LAN reporting
+
+One machine runs the receiver and each dashboard reports its own derived aggregates to it. The receiver defaults to loopback-only access, so LAN access must be deliberately enabled in its generated settings.
+
+Initialize and configure the receiver:
+
+```powershell
+dotnet run --project .\src\CodexUsage.Receiver -- --init
+dotnet run --project .\src\CodexUsage.Receiver -- --add-client <client-id> "<machine name>"
+dotnet run --project .\src\CodexUsage.Receiver
+```
+
+The client ID is shown in **Settings → Network**. The add-client command asks for a shared passphrase without displaying it. Enter the same passphrase in that machine's dashboard, set the receiver's `http://host:port` address, test the encrypted exchange, and enable reporting.
+
+The receiver writes its settings and SQLite database under `%LOCALAPPDATA%\Codex Usage Receiver`. Set `CODEX_USAGE_RECEIVER_DATA` to use a different data directory, which is useful for service accounts or isolated testing. Edit `receiver-settings.json` to choose the listening address and explicit allowed CIDR ranges before starting it on the LAN.
 
 ## Limitations
 
@@ -57,16 +74,6 @@ Future multi-machine reporting will transmit only derived, aggregated usage stat
 - Historical accuracy depends on the local session logs still being present.
 - Codex log formats are not a public compatibility contract and may change; unsupported record formats should be reported as issues.
 - Token totals represent logged token activity and should not be treated as authoritative billing or plan-quota calculations.
-
-## Longer-term roadmap
-
-- A macOS client with feature parity with the Windows client
-- Optional delivery of aggregated usage statistics from multiple machines
-- A receiver that consolidates those aggregates into one dashboard without accepting raw logs
-- Per-machine and combined usage reporting
-- Authentication, transport security, deduplication, and explicit privacy controls for transmitted aggregates
-
-The goal is a single place to understand Codex usage across all of your machines—because we can.
 
 ## Requirements
 
@@ -92,4 +99,4 @@ Launch `Codex Usage.exe` from the resulting `dist` directory.
 
 ## Current status
 
-The Windows client includes local usage reporting, interactive 30-day history, configurable session-log location, themes, and snapshot export. This is the feature set intended for the v1 freeze.
+The Windows client includes local reporting, interactive 30-day history, configurable session-log location, themes, snapshot export, and optional encrypted aggregate reporting to a LAN receiver.
