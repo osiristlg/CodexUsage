@@ -10,7 +10,12 @@ public struct HTTPTransport: ExchangeTransport {
         config.timeoutIntervalForRequest = 20; config.timeoutIntervalForResource = 30
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await session.data(for: request) }
+        catch let error as URLError where error.code == .notConnectedToInternet {
+            throw UsageError.invalid("The receiver is unavailable. Check this app's Local Network permission and the receiver address; this does not mean the Internet is offline.")
+        }
         guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
             throw UsageError.invalid("Receiver rejected the request. Check registration, address and subnet settings.")
         }

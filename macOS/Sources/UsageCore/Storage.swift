@@ -49,7 +49,10 @@ public enum KeychainStore {
         return [kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
                 kSecAttrAccount as String: account,
-                kSecUseAuthenticationContext as String: context]
+                kSecUseAuthenticationContext as String: context,
+                // Keep the legacy query flag as a second guard for ad-hoc builds on systems
+                // that still show an ACL prompt despite interactionNotAllowed.
+                kSecUseAuthenticationUI as String: "u_AuthUIF"]
     }
     public static func save(_ key: Data, account: String) throws {
         guard key.count == 32 else { throw UsageError.invalid("Invalid derived key.") }

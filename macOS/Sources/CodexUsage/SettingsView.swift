@@ -67,7 +67,7 @@ struct SettingsView: View {
     private func rail(_ theme: DashboardTheme) -> some View {
         VStack(spacing: 0) {
             ForEach(SettingsPage.allCases, id: \.rawValue) { item in
-                Button { page = item } label: {
+                Button { page = item; message = "" } label: {
                     HStack(spacing: 13) {
                         Image(systemName: item.icon).frame(width: 18)
                         Text(item.title)
@@ -104,7 +104,9 @@ struct SettingsView: View {
                 }
             }
             Spacer()
-            if !message.isEmpty { Text(message).font(.system(size: 11)).foregroundStyle(message.contains("verified") ? theme.primary : theme.secondary).textSelection(.enabled) }
+            if page == .network && !message.isEmpty {
+                Text(message).font(.system(size: 11)).foregroundStyle(message.contains("verified") ? theme.primary : theme.secondary).textSelection(.enabled)
+            }
         }.padding(.horizontal, 48).padding(.vertical, 32)
     }
 
