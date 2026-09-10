@@ -1,5 +1,7 @@
 # Codex Usage
 
+![Codex Usage 1.1 dashboard showing combined activity across machines](docs/codex-usage-v1.1-dashboard.png)
+
 Codex Usage is a small desktop dashboard that makes Codex activity easier to understand. It turns the usage records already on your computer into clear daily and historical views. There are native versions for Windows and macOS, and your raw conversations stay on the machine where they happened.
 
 Version 1.1 can also bring several computers together on your own local network. You can look at this computer, all computers, or one named computer without sending raw logs to the receiver.
