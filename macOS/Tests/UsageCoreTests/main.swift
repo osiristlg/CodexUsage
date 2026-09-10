@@ -9,3 +9,6 @@ func expectThrows<T>(_ value: @autoclosure () throws -> T, file: StaticString = 
 try ProtocolTests().testPublishedWindowsVector()
 try ProtocolTests().testNormalizationAndTimestamp()
 print("PASS: Windows golden vector, tampering, wrong key, version, NFKC and timestamp checks")
+try ScannerTests().run()
+try await networkChecks()
+print("PASS: scanner precedence, privacy, hour boundaries, local 2am scheduling, DST and retry identity")
