@@ -42,6 +42,7 @@ if (args.Length >= 3 && string.Equals(args[0], "--add-client", StringComparison.
 }
 
 var receiverSettings = ReceiverSettingsStore.Load(settingsPath);
+var receiverSettingsProvider = new ReceiverSettingsProvider(settingsPath, receiverSettings);
 await UsageDatabase.InitializeAsync(databasePath);
 
 var builder = WebApplication.CreateBuilder(args);
@@ -53,27 +54,31 @@ builder.WebHost.ConfigureKestrel(options =>
 });
 var app = builder.Build();
 
-app.MapGet("/health", () => Results.Ok(new
+app.MapGet("/health", () =>
 {
-    service = "Codex Usage Receiver",
-    protocolVersion = AggregateProtocol.Version,
-    clients = ReceiverSettingsStore.Load(settingsPath).Clients.Count(c => c.Enabled)
-}));
+    var settings = receiverSettingsProvider.Current;
+    return Results.Ok(new
+    {
+        service = "Codex Usage Receiver",
+        protocolVersion = AggregateProtocol.Version,
+        clients = settings.Clients.Count(c => c.Enabled)
+    });
+});
 
 app.MapGet("/api/v1/salt/{clientId}", (string clientId, HttpContext context) =>
 {
-    var currentSettings = ReceiverSettingsStore.Load(settingsPath);
-    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, currentSettings.AllowedSubnets)) return Results.NotFound();
-    var client = currentSettings.Clients.FirstOrDefault(c => c.Enabled &&
+    var settings = receiverSettingsProvider.Current;
+    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, settings.AllowedSubnets)) return Results.NotFound();
+    var client = settings.Clients.FirstOrDefault(c => c.Enabled &&
         string.Equals(c.ClientId, clientId, StringComparison.OrdinalIgnoreCase));
     return client is null ? Results.NotFound() : Results.Ok(new { version = AggregateProtocol.Version, salt = client.Salt });
 });
 
 app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext context) =>
 {
-    var currentSettings = ReceiverSettingsStore.Load(settingsPath);
-    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, currentSettings.AllowedSubnets)) return Results.NotFound();
-    var client = currentSettings.Clients.FirstOrDefault(c => c.Enabled &&
+    var settings = receiverSettingsProvider.Current;
+    if (!NetworkPolicy.IsAllowed(context.Connection.RemoteIpAddress, settings.AllowedSubnets)) return Results.NotFound();
+    var client = settings.Clients.FirstOrDefault(c => c.Enabled &&
         string.Equals(c.ClientId, envelope.ClientId, StringComparison.OrdinalIgnoreCase));
     if (client is null) return Results.NotFound();
     if (Math.Abs((DateTime.UtcNow - envelope.CreatedAtUtc.ToUniversalTime()).TotalMinutes) > 15)
@@ -89,14 +94,14 @@ app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext c
         catch (Exception ex) when (ex is CryptographicException or JsonException or FormatException)
         { return Results.Unauthorized(); }
 
-        var validation = PayloadValidation.Validate(payload, currentSettings.MaxRowsPerRequest);
+        var validation = PayloadValidation.Validate(payload, settings.MaxRowsPerRequest);
         if (validation is not null) return Results.BadRequest(new { error = validation });
 
         var result = await UsageDatabase.ReplaceAndSummarizeAsync(databasePath, client.ClientId, payload, envelope.RequestId);
         var namedMachines = new Dictionary<string, TokenCounts>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in result.Machines)
         {
-            var name = currentSettings.Clients.FirstOrDefault(c =>
+            var name = settings.Clients.FirstOrDefault(c =>
                 string.Equals(c.ClientId, pair.Key, StringComparison.OrdinalIgnoreCase))?.MachineName ?? pair.Key;
             if (namedMachines.ContainsKey(name)) name = $"{name} ({pair.Key[..Math.Min(8, pair.Key.Length)]})";
             namedMachines[name] = pair.Value;
@@ -104,7 +109,7 @@ app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext c
         var namedMachineRows = new Dictionary<string, IReadOnlyList<AggregateRow>>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in result.MachineRows)
         {
-            var name = currentSettings.Clients.FirstOrDefault(c =>
+            var name = settings.Clients.FirstOrDefault(c =>
                 string.Equals(c.ClientId, pair.Key, StringComparison.OrdinalIgnoreCase))?.MachineName ?? pair.Key;
             if (namedMachineRows.ContainsKey(name)) name = $"{name} ({pair.Key[..Math.Min(8, pair.Key.Length)]})";
             namedMachineRows[name] = pair.Value;
@@ -170,6 +175,29 @@ internal static class ReceiverSettingsStore
         var temporary = path + ".tmp";
         File.WriteAllText(temporary, JsonSerializer.Serialize(settings, Options));
         File.Move(temporary, path, true);
+    }
+}
+
+internal sealed class ReceiverSettingsProvider(string path, ReceiverSettings initial)
+{
+    private readonly object gate = new();
+    private ReceiverSettings current = initial;
+
+    public ReceiverSettings Current
+    {
+        get
+        {
+            lock (gate)
+            {
+                try
+                {
+                    current = ReceiverSettingsStore.Load(path);
+                }
+                catch (IOException) { }
+                catch (JsonException) { }
+                return current;
+            }
+        }
     }
 }
 

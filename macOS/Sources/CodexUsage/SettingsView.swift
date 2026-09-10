@@ -3,10 +3,10 @@ import AppKit
 import UsageCore
 
 private enum SettingsPage: Int, CaseIterable {
-    case dashboard, data, snapshot, network
-    var title: String { ["Dashboard", "Codex Data", "Snapshot Export", "Network Reporting"][rawValue] }
-    var subtitle: String { ["Tune the live experience without leaving the cockpit.", "Control where local usage is discovered.", "Keep one fresh dashboard image wherever you need it.", "Encrypted aggregate reporting across your private network."][rawValue] }
-    var icon: String { ["rectangle.3.group", "house", "photo", "network"][rawValue] }
+    case dashboard, data, snapshot, network, receiver
+    var title: String { ["Dashboard", "Codex Data", "Snapshot Export", "Network Reporting", "Receiver Host"][rawValue] }
+    var subtitle: String { ["Tune the live experience without leaving the cockpit.", "Control where local usage is discovered.", "Keep one fresh dashboard image wherever you need it.", "Encrypted aggregate reporting across your private network.", "Host the same private receiver on this Mac with .NET 10."][rawValue] }
+    var icon: String { ["rectangle.3.group", "house", "photo", "network", "server.rack"][rawValue] }
 }
 
 struct SettingsView: View {
@@ -18,11 +18,18 @@ struct SettingsView: View {
     @State private var message = ""
     @State private var testing = false
     @State private var snapshotEnabled: Bool
+    @State private var receiverBind: String
+    @State private var receiverPort: String
+    @State private var receiverSubnets: String
+    @State private var receiverPassphrase = ""
 
     init(model: DashboardModel) {
         self.model = model
         _draft = State(initialValue: model.settings)
         _snapshotEnabled = State(initialValue: !model.settings.snapshotFolder.isEmpty)
+        _receiverBind = State(initialValue: model.receiverHost.configuration.bindAddress)
+        _receiverPort = State(initialValue: String(model.receiverHost.configuration.port))
+        _receiverSubnets = State(initialValue: model.receiverHost.configuration.allowedSubnets.joined(separator: "\n"))
     }
 
     var body: some View {
@@ -35,7 +42,7 @@ struct SettingsView: View {
             }
             footer(theme)
         }
-        .frame(width: 980, height: 680)
+        .frame(width: 1040, height: 760)
         .background(theme.background)
         .foregroundStyle(theme.text)
         .environment(\.dashboardTheme, theme)
@@ -93,6 +100,7 @@ struct SettingsView: View {
                 case .data: dataPage(theme)
                 case .snapshot: snapshotPage(theme)
                 case .network: networkPage(theme)
+                case .receiver: receiverPage(theme)
                 }
             }
             Spacer()
@@ -169,6 +177,11 @@ struct SettingsView: View {
         .overlay(RoundedRectangle(cornerRadius: 4).stroke(theme.tertiary.opacity(0.18)))
     }
 
+    private func receiverPage(_ theme: DashboardTheme) -> some View {
+        ReceiverHostView(host: model.receiverHost, clientSettings: draft, bindAddress: $receiverBind,
+                         port: $receiverPort, subnets: $receiverSubnets, passphrase: $receiverPassphrase)
+    }
+
     private func footer(_ theme: DashboardTheme) -> some View {
         HStack { Spacer(); Button("Cancel") { dismiss() }.buttonStyle(ControlDeckButtonStyle(accent: theme.muted)); Button("Save changes") { save() }.buttonStyle(ControlDeckButtonStyle(accent: theme.primary)).disabled(testing || model.busy) }
             .padding(.horizontal, 28).frame(height: 78).background(theme.background.opacity(0.82))
@@ -186,6 +199,111 @@ struct SettingsView: View {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.canCreateDirectories = true; panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url { selected(url.path) }
+    }
+}
+
+private struct ReceiverHostView: View {
+    @ObservedObject var host: ReceiverHostModel
+    let clientSettings: UsageCore.Settings
+    @Binding var bindAddress: String
+    @Binding var port: String
+    @Binding var subnets: String
+    @Binding var passphrase: String
+    @Environment(\.dashboardTheme) private var theme
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Circle().fill(host.healthy ? theme.primary : theme.muted).frame(width: 9, height: 9)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(host.running ? "RECEIVER HOST ACTIVE" : "RECEIVER HOST").font(.system(size: 10, weight: .bold)).tracking(0.8)
+                        Text(host.runtimeMessage).font(.system(size: 11)).foregroundStyle(theme.muted)
+                    }
+                    Spacer()
+                    Link("Get .NET 10", destination: URL(string: "https://dotnet.microsoft.com/download/dotnet/10.0")!)
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.secondary)
+                    Button("Check") { host.refreshInstallation(); Task { await host.checkHealth() } }.buttonStyle(ControlDeckButtonStyle(accent: theme.muted))
+                }.padding(16).background(theme.panel.opacity(0.92), in: RoundedRectangle(cornerRadius: 4))
+
+                HStack(spacing: 9) {
+                    Button("Initialize receiver") {
+                        host.initializeReceiver(); syncFields()
+                    }.buttonStyle(ControlDeckButtonStyle(accent: theme.secondary))
+                    Button(host.running ? "Running" : "Start receiver") { Task { await host.start() } }
+                        .buttonStyle(ControlDeckButtonStyle(accent: theme.primary)).disabled(host.running)
+                    Button("Stop") { host.stop() }.buttonStyle(ControlDeckButtonStyle(accent: theme.muted)).disabled(!host.running)
+                    Spacer()
+                    Text("\(host.clientCount) enabled client\(host.clientCount == 1 ? "" : "s")").font(.system(size: 10)).foregroundStyle(theme.tertiary)
+                }
+
+                VStack(spacing: 6) {
+                    NetworkRow("BIND ADDRESS") { TextField("127.0.0.1", text: $bindAddress).textFieldStyle(ControlDeckFieldStyle()) }
+                    NetworkRow("PORT") { TextField("4747", text: $port).textFieldStyle(ControlDeckFieldStyle()).frame(width: 110) }
+                    NetworkRow("ALLOWED SUBNETS") {
+                        TextField("192.168.1.0/24, 127.0.0.0/8", text: $subnets).textFieldStyle(ControlDeckFieldStyle())
+                    }
+                    HStack {
+                        Text("Use explicit LAN CIDRs. Unrestricted /0 ranges are rejected.").font(.system(size: 10)).foregroundStyle(theme.muted)
+                        Spacer()
+                        Button("Save host settings") { host.saveConfiguration(bindAddress: bindAddress, portText: port, subnetsText: subnets) }
+                            .buttonStyle(ControlDeckButtonStyle(accent: theme.secondary))
+                    }
+                }.padding(16).background(theme.panel.opacity(0.92), in: RoundedRectangle(cornerRadius: 4))
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(theme.tertiary.opacity(0.18)))
+
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack {
+                        Text("LOCAL RECEIVER CLIENTS").font(.system(size: 10, weight: .bold)).tracking(0.7).foregroundStyle(theme.tertiary)
+                        Spacer()
+                        Text("Select clients to rotate together").font(.system(size: 10)).foregroundStyle(theme.muted)
+                    }
+                    if host.configuration.clients.isEmpty {
+                        Text("No clients registered. Add this Mac below, then use the same shared passphrase in Network Reporting.")
+                            .font(.system(size: 11)).foregroundStyle(theme.muted).padding(.vertical, 5)
+                    } else {
+                        ForEach(host.configuration.clients) { client in
+                            HStack(spacing: 10) {
+                                Toggle("Select \(client.machineName)", isOn: Binding(
+                                    get: { host.selectedClientIds.contains(client.clientId) },
+                                    set: { selected in
+                                        if selected { host.selectedClientIds.insert(client.clientId) }
+                                        else { host.selectedClientIds.remove(client.clientId) }
+                                    })).labelsHidden().toggleStyle(.checkbox).tint(theme.primary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(client.machineName).font(.system(size: 11, weight: .semibold))
+                                    Text(client.clientId).font(.system(size: 9, design: .monospaced)).foregroundStyle(theme.muted).textSelection(.enabled)
+                                }
+                                Spacer()
+                                Toggle("Enabled", isOn: Binding(get: { client.enabled }, set: { host.setEnabled($0, clientId: client.clientId) }))
+                                    .toggleStyle(.switch).tint(theme.primary).font(.system(size: 10)).fixedSize()
+                            }.padding(.horizontal, 10).frame(height: 43).background(theme.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                    HStack(spacing: 10) {
+                        SecureField("New shared passphrase", text: $passphrase).textFieldStyle(ControlDeckFieldStyle())
+                        Button("Add this Mac") {
+                            let secret = passphrase; passphrase = ""
+                            host.register(clientId: clientSettings.clientId, machineName: clientSettings.machineName, passphrase: secret)
+                        }.buttonStyle(ControlDeckButtonStyle(accent: theme.secondary))
+                        Button("Rotate selected") {
+                            let secret = passphrase; passphrase = ""; host.rotateSelected(passphrase: secret)
+                        }.buttonStyle(ControlDeckButtonStyle(accent: theme.primary)).disabled(host.selectedClientIds.isEmpty)
+                    }
+                    Text("After adding or rotating, enter the matching passphrase in each selected client app and test its encrypted connection. Stored salts and derived keys are never displayed or served over the network.")
+                        .font(.system(size: 10)).foregroundStyle(theme.muted).fixedSize(horizontal: false, vertical: true)
+                }.padding(16).background(theme.panel.opacity(0.92), in: RoundedRectangle(cornerRadius: 4))
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(theme.primary.opacity(0.12)))
+
+                Text(host.statusMessage).font(.system(size: 11)).foregroundStyle(host.healthy ? theme.primary : theme.secondary).textSelection(.enabled)
+            }
+        }
+        .task { host.refreshInstallation(); syncFields(); await host.checkHealth() }
+    }
+
+    private func syncFields() {
+        bindAddress = host.configuration.bindAddress; port = String(host.configuration.port)
+        subnets = host.configuration.allowedSubnets.joined(separator: "\n")
     }
 }
 

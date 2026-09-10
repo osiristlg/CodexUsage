@@ -1,4 +1,16 @@
-# Codex Usage 1.1
+# Codex Usage 1.1.1
+
+Version 1.1.1 adds native Mac controls for hosting the existing .NET receiver.
+
+## Mac receiver hosting
+
+- Initialize, configure, start, stop and health-check the Kestrel receiver from **Settings → Receiver Host**.
+- Register this Mac, enable local receiver clients, or select several clients and rotate their shared passphrase together.
+- Validate bind addresses, ports and explicit CIDR allowlists; unrestricted `/0` ranges are rejected.
+- Apply receiver client and credential changes on the next request without restart. Listener address and port changes still require restart.
+- Bundle the framework-dependent receiver payload in equipped builds while clearly requiring the .NET 10 ASP.NET Core runtime.
+
+## Codex Usage 1.1
 
 Version 1.1 turns Codex Usage from a useful Windows dashboard into a small multi-machine family.
 

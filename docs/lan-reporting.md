@@ -32,6 +32,12 @@ Prompts, responses, raw log records, filenames, session IDs, repository paths, a
 6. Set the dashboard receiver address, choose the project-detail level, click **Test connection**, then enable reporting and save.
 7. Start the receiver with `dotnet run --project .\src\CodexUsage.Receiver` or arrange for its published executable to run at sign-in.
 
+### Hosting from the macOS app
+
+Mac-only households can use **Settings → Receiver Host** instead of a terminal. Install the .NET 10 ASP.NET Core runtime, initialize the receiver, choose a bind address, port and explicit allowed LAN subnets, then add this Mac or manage existing clients. The app runs the same framework-dependent Kestrel receiver used on Windows. It does not implement a separate Swift server.
+
+The page can enable clients and rotate one or several selected clients to a new shared passphrase. Credential changes are read from the atomic settings file on the next request, without a receiver restart. Enter the matching passphrase in each affected client app and test its encrypted connection. Bind-address and port changes still require a restart.
+
 Repeat registration for each dashboard. Each client receives its own random salt and derived key.
 
 ## Synchronization behaviour
@@ -50,7 +56,7 @@ On Windows, each dashboard stores only a DPAPI-protected derived key. The receiv
 
 ## Receiver data and backup
 
-By default, receiver files are under `%LOCALAPPDATA%\Codex Usage Receiver`:
+By default, receiver files are under `%LOCALAPPDATA%\Codex Usage Receiver` on Windows. Receiver Host on macOS uses `~/Library/Application Support/Codex Usage/Receiver`:
 
 - `receiver-settings.json` contains the bind policy and client credentials.
 - `usage.db` contains aggregate rows and replay records.

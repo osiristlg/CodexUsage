@@ -13,6 +13,8 @@ print("PASS: Windows golden vector, tampering, wrong key, version, NFKC and time
 try ScannerTests().run()
 try await networkChecks()
 print("PASS: scanner precedence, privacy, hour boundaries, local 2am scheduling, DST and retry identity")
+try ReceiverConfigurationTests().run()
+print("PASS: receiver settings schema, validation, registration and credential rotation")
 
 if CommandLine.arguments.contains("--scan-local") {
     let now = Date()

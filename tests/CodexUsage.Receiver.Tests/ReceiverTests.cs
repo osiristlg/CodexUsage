@@ -97,6 +97,36 @@ public sealed class ReceiverTests
         Assert.Equal("Invalid project identifier.", PayloadValidation.Validate(invalid, 10));
     }
 
+    [Fact]
+    public void SettingsProviderReloadsCredentialChangesWithoutRestart()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "codex-usage-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "receiver-settings.json");
+        try
+        {
+            var initial = ReceiverSettings.Default with
+            {
+                Clients = [new ClientAccess("client-a", "Mac A", "salt-a", "key-a", true)]
+            };
+            ReceiverSettingsStore.Save(path, initial);
+            var provider = new ReceiverSettingsProvider(path, initial);
+            var updated = initial with
+            {
+                Clients = [new ClientAccess("client-a", "Mac A", "salt-b", "key-b", true),
+                           new ClientAccess("client-b", "Mac B", "salt-c", "key-c", true)]
+            };
+            ReceiverSettingsStore.Save(path, updated);
+
+            Assert.Equal("key-b", provider.Current.Clients[0].Key);
+            Assert.Equal(2, provider.Current.Clients.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
     private static SyncPayload Payload(DateTime start, TokenCounts counts) => new(
         "incremental", "Machine A", start, start.AddHours(1), start, start.AddHours(1),
         [new AggregateRow(start, "Model", "Project", counts)]);

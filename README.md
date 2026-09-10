@@ -74,9 +74,11 @@ The client ID is shown in **Settings → Network**. The add-client command asks 
 
 The receiver writes its settings and SQLite database under `%LOCALAPPDATA%\Codex Usage Receiver`. Set `CODEX_USAGE_RECEIVER_DATA` to use a different data directory, which is useful for service accounts or isolated testing. Edit `receiver-settings.json` to choose the listening address and explicit allowed CIDR ranges before starting it on the LAN.
 
+On macOS 14 or later, **Settings → Receiver Host** provides the same setup without a terminal. It hosts the existing Kestrel receiver and requires the .NET 10 ASP.NET Core runtime. The page configures the listener and CIDR allowlist, starts and stops the process, reports health, manages local clients, and rotates selected client credentials. Release builds bundle the framework-dependent receiver payload; they do not bundle the .NET runtime.
+
 ## Windows and Mac
 
-The Windows and macOS apps share the same goal and the same network format, while still feeling at home on their respective platforms. Either one can report aggregate usage to the receiver. The receiver can then show combined totals and per-machine graphs without collecting prompts, responses, raw logs, filenames, or working-directory paths.
+The Windows and macOS apps share the same goal and the same network format, while still feeling at home on their respective platforms. Either one can report aggregate usage to the receiver, and macOS can host that receiver when .NET 10 is installed. The receiver can then show combined totals and per-machine graphs without collecting prompts, responses, raw logs, filenames, or working-directory paths.
 
 The Linux client is the missing member of the family. If you would like to port it, you are warmly invited—the protocol, receiver, and existing clients are all here to build from. Do it because you can.
 

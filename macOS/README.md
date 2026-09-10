@@ -1,6 +1,6 @@
 # Codex Usage for macOS
 
-A native SwiftUI and Swift Charts client for macOS 14 or later. Version 1.1 shares aggregate protocol v1 with the Windows client and receiver. No third-party Swift packages are required.
+A native SwiftUI and Swift Charts app for macOS 14 or later. Version 1.1.1 can report to a receiver or host the existing .NET/Kestrel receiver for a Mac-only household. The Swift app has no third-party packages.
 
 ## Build and run
 
@@ -41,6 +41,14 @@ Reporting starts disabled. In **Settings → Network**:
 Pairing derives the key locally, verifies an encrypted query, and stores only the derived 32-byte key in macOS Keychain. Keychain entries are scoped to the receiver and client ID and are device-local. The passphrase is cleared from the form and never persisted or transmitted. Anonymous project IDs are the default; **Project names** is an explicit opt-in. No project breakdown merges rows into `All projects`.
 
 Local development bundles are ad-hoc signed, so rebuilding changes the app's Keychain identity. Keychain reads are noninteractive and cached for the running app. An accessible credential from the earlier service migrates automatically; if macOS will not release it to the rebuilt app, Settings asks for the receiver shared passphrase once and safely recreates the derived-key item under the stable service. The app never asks for or changes the Mac login Keychain password.
+
+### Hosting the receiver on a Mac
+
+Open **Settings → Receiver Host**. The page initializes the receiver data directory, validates the bind address, port and explicit allowed CIDRs, registers this Mac as a client, starts or stops the local receiver, and shows live health and enabled-client counts. It can select several local clients and rotate their shared passphrase in one operation. Enter that same passphrase in every selected client app afterward.
+
+Hosting requires the .NET 10 ASP.NET Core runtime. The release app bundles the framework-dependent receiver DLL and its dependencies; it does not bundle the runtime. GUI launches locate standard Intel and Apple Silicon .NET installations without relying on the shell `PATH`. Credentials stay in `~/Library/Application Support/Codex Usage/Receiver/receiver-settings.json`; salts and derived keys are never displayed or exposed by an administration endpoint. Client enablement and credential changes take effect without restarting the receiver. Bind-address and port changes require a restart because Kestrel owns the listening socket.
+
+`build-app.sh` publishes and embeds the receiver when a .NET SDK is installed. A release pipeline can instead set `CODEX_USAGE_RECEIVER_PAYLOAD` to an existing framework-dependent `dotnet publish` directory. A build without either remains a fully functional reporting client and explains that its receiver payload is unavailable.
 
 Normal refreshes replace the current and previous UTC hours. The first successful refresh after 2 a.m. local time replaces 30 local calendar days, as does a rebuild. A failed attempt does not advance the successful full-sync marker. Network and privacy configuration changes also queue full reconciliation. Combined totals are labeled as the last successful sync and are hidden when they refer to a previous local day or reporting is disabled.
 

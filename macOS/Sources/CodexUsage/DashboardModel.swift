@@ -3,6 +3,7 @@ import AppKit
 import UsageCore
 
 @MainActor final class DashboardModel: ObservableObject {
+    let receiverHost = ReceiverHostModel()
     @Published var settings = LocalStore.load("mac-settings.json", as: UsageCore.Settings.self) ?? UsageCore.Settings()
     @Published var points: [UsagePoint] = []
     @Published var network = NetworkState()
