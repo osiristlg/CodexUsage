@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CodexUsage.Core;
 
@@ -13,7 +14,11 @@ public sealed record AggregateRow(
     DateTime BucketStartUtc,
     string Model,
     string Project,
-    TokenCounts Tokens);
+    TokenCounts Tokens)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ProjectId { get; init; }
+}
 
 public sealed record SyncPayload(
     string Kind,
@@ -22,14 +27,25 @@ public sealed record SyncPayload(
     DateTime RangeEndUtc,
     DateTime CombinedStartUtc,
     DateTime CombinedEndUtc,
-    IReadOnlyList<AggregateRow> Rows);
+    IReadOnlyList<AggregateRow> Rows)
+{
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DateTime? QueryStartUtc { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DateTime? QueryEndUtc { get; init; }
+}
 
 public sealed record ExchangeReply(
     bool Accepted,
     string Message,
     DateTime ReceivedAtUtc,
     TokenCounts Combined,
-    IReadOnlyDictionary<string, TokenCounts> Machines);
+    IReadOnlyDictionary<string, TokenCounts> Machines)
+{
+    public IReadOnlyList<AggregateRow> Rows { get; init; } = [];
+    public IReadOnlyDictionary<string, IReadOnlyList<AggregateRow>> MachineRows { get; init; } =
+        new Dictionary<string, IReadOnlyList<AggregateRow>>();
+}
 
 public sealed record EncryptedEnvelope(
     int Version,

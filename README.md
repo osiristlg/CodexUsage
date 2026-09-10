@@ -1,8 +1,8 @@
 # Codex Usage
 
-Codex Usage is a lightweight desktop dashboard for understanding how Codex is being used on your machine. It reads the session logs written by Codex, turns the token records into useful daily and historical views, and keeps everything local.
+Codex Usage is a small desktop dashboard that makes Codex activity easier to understand. It turns the usage records already on your computer into clear daily and historical views. There are native versions for Windows and macOS, and your raw conversations stay on the machine where they happened.
 
-The current client is built for Windows with .NET and Windows Forms.
+Version 1.1 can also bring several computers together on your own local network. You can look at this computer, all computers, or one named computer without sending raw logs to the receiver.
 
 ## What it shows
 
@@ -13,6 +13,8 @@ The current client is built for Windows with .NET and Windows Forms.
 - Historical hourly and project breakdowns
 - Automatic refresh, with a configurable interval
 - Optional encrypted, aggregate-only reporting across machines on the same LAN
+- A single view selector for switching every graph between this computer, all computers, or another computer
+- Stable private project IDs, with optional project names when you choose to share them
 - Several built-in visual themes
 
 Hover over the charts for more detail. Select a day in the 30-day chart to inspect it, and use **Rebuild 30 days** when you want to rescan the local history immediately.
@@ -48,7 +50,7 @@ It does not modify those logs. Unless you explicitly enable LAN reporting, it do
 %LOCALAPPDATA%\Codex Usage
 ```
 
-Project names are derived from the working directories recorded in the session logs. They remain local unless you deliberately place an exported snapshot in a shared location or choose **Project names** for LAN reporting. Snapshot export can replace names with generic labels. LAN reporting defaults to stable anonymous project IDs and can instead omit the project breakdown entirely.
+Project names are derived from the working directories recorded in the session logs. They remain local unless you deliberately place an exported snapshot in a shared location or choose **Project names** for LAN reporting. Snapshot export can replace names with generic labels. LAN reporting defaults to stable anonymous project IDs and can instead omit the project breakdown entirely. If you later choose to share project names, the client sends the name alongside its stable private ID so matching anonymous history can be labelled consistently.
 
 LAN reporting transmits only hourly token counts grouped by model and, depending on your privacy setting, project. Raw Codex logs, prompts, responses, filenames, and paths remain on the machine where they were created. The receiver has no endpoint for raw-log upload. See [LAN reporting](docs/lan-reporting.md) for setup and security details.
 
@@ -68,14 +70,20 @@ The client ID is shown in **Settings → Network**. The add-client command asks 
 
 The receiver writes its settings and SQLite database under `%LOCALAPPDATA%\Codex Usage Receiver`. Set `CODEX_USAGE_RECEIVER_DATA` to use a different data directory, which is useful for service accounts or isolated testing. Edit `receiver-settings.json` to choose the listening address and explicit allowed CIDR ranges before starting it on the LAN.
 
+## Windows and Mac
+
+The Windows and macOS apps share the same goal and the same network format, while still feeling at home on their respective platforms. Either one can report aggregate usage to the receiver. The receiver can then show combined totals and per-machine graphs without collecting prompts, responses, raw logs, filenames, or working-directory paths.
+
+The Linux client is the missing member of the family. If you would like to port it, you are warmly invited—the protocol, receiver, and existing clients are all here to build from. Do it because you can.
+
 ## Limitations
 
-- Codex Usage reports activity recorded in local Codex session logs. It does not include activity from other machines, cloud-only sessions, or other ChatGPT surfaces.
+- Codex Usage reports activity recorded in local Codex session logs. With network sync enabled it can include other enrolled computers, but not cloud-only sessions or other ChatGPT surfaces.
 - Historical accuracy depends on the local session logs still being present.
 - Codex log formats are not a public compatibility contract and may change; unsupported record formats should be reported as issues.
 - Token totals represent logged token activity and should not be treated as authoritative billing or plan-quota calculations.
 
-## Requirements
+## Windows requirements
 
 - Windows 10 or later
 - A compatible .NET Desktop Runtime for framework-dependent builds
@@ -97,6 +105,10 @@ dotnet publish -c Release -o .\dist --self-contained false
 
 Launch `Codex Usage.exe` from the resulting `dist` directory.
 
+The macOS client is built from the Xcode project in `macOS/CodexUsage`.
+
 ## Current status
 
-The Windows client includes local reporting, interactive 30-day history, configurable session-log location, themes, snapshot export, and optional encrypted aggregate reporting to a LAN receiver.
+Version 1.1 includes native Windows and macOS dashboards, interactive history, themes, snapshot export on Windows, and optional encrypted aggregate reporting across your local network.
+
+Small utilities, made because we can.

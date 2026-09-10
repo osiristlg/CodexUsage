@@ -99,8 +99,20 @@ app.MapPost("/api/v1/exchange", async (EncryptedEnvelope envelope, HttpContext c
             if (namedMachines.ContainsKey(name)) name = $"{name} ({pair.Key[..Math.Min(8, pair.Key.Length)]})";
             namedMachines[name] = pair.Value;
         }
+        var namedMachineRows = new Dictionary<string, IReadOnlyList<AggregateRow>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in result.MachineRows)
+        {
+            var name = receiverSettings.Clients.FirstOrDefault(c =>
+                string.Equals(c.ClientId, pair.Key, StringComparison.OrdinalIgnoreCase))?.MachineName ?? pair.Key;
+            if (namedMachineRows.ContainsKey(name)) name = $"{name} ({pair.Key[..Math.Min(8, pair.Key.Length)]})";
+            namedMachineRows[name] = pair.Value;
+        }
         var reply = new ExchangeReply(true, result.Duplicate ? "Already accepted" : "Accepted", DateTime.UtcNow,
-            result.Combined, namedMachines);
+            result.Combined, namedMachines)
+        {
+            Rows = result.Rows,
+            MachineRows = namedMachineRows
+        };
         return Results.Ok(AggregateProtocol.Encrypt(client.ClientId, Guid.NewGuid().ToString(), DateTime.UtcNow, reply, key));
     }
     finally { CryptographicOperations.ZeroMemory(key); }
@@ -199,6 +211,11 @@ internal static class PayloadValidation
             return "Invalid synchronization range.";
         if (payload.CombinedEndUtc <= payload.CombinedStartUtc || payload.CombinedEndUtc - payload.CombinedStartUtc > TimeSpan.FromDays(2))
             return "Invalid combined-total range.";
+        if (payload.QueryStartUtc.HasValue != payload.QueryEndUtc.HasValue) return "Incomplete query range.";
+        if (payload.QueryStartUtc is { } queryStart && payload.QueryEndUtc is { } queryEnd &&
+            (queryStart.Kind != DateTimeKind.Utc || queryEnd.Kind != DateTimeKind.Utc || queryEnd <= queryStart ||
+             queryEnd - queryStart > TimeSpan.FromDays(31)))
+            return "Invalid aggregate-query range.";
         if (payload.Rows.Count > maxRows) return "Too many aggregate rows.";
         if (payload.Kind == "query" && payload.Rows.Count != 0) return "Query requests cannot contain aggregate rows.";
         foreach (var row in payload.Rows)
@@ -207,6 +224,7 @@ internal static class PayloadValidation
                 row.BucketStartUtc < payload.RangeStartUtc || row.BucketStartUtc >= payload.RangeEndUtc)
                 return "An aggregate bucket is outside the declared range or not hour-aligned.";
             if (row.Model.Length is < 1 or > 100 || row.Project.Length is < 1 or > 200) return "Invalid aggregate label.";
+            if (row.ProjectId is { Length: > 80 }) return "Invalid project identifier.";
             if (row.Tokens.Input < 0 || row.Tokens.CachedInput < 0 || row.Tokens.Output < 0 || row.Tokens.Reasoning < 0 || row.Tokens.Responses < 0)
                 return "Negative aggregate value.";
         }
@@ -214,7 +232,12 @@ internal static class PayloadValidation
     }
 }
 
-internal sealed record DatabaseResult(bool Duplicate, TokenCounts Combined, IReadOnlyDictionary<string, TokenCounts> Machines);
+internal sealed record DatabaseResult(
+    bool Duplicate,
+    TokenCounts Combined,
+    IReadOnlyDictionary<string, TokenCounts> Machines,
+    IReadOnlyList<AggregateRow> Rows,
+    IReadOnlyDictionary<string, IReadOnlyList<AggregateRow>> MachineRows);
 
 internal static class UsageDatabase
 {
@@ -237,6 +260,7 @@ internal static class UsageDatabase
               client_id TEXT NOT NULL,
               bucket_utc TEXT NOT NULL,
               project TEXT NOT NULL,
+              project_id TEXT NULL,
               model TEXT NOT NULL,
               input_tokens INTEGER NOT NULL,
               cached_tokens INTEGER NOT NULL,
@@ -252,8 +276,26 @@ internal static class UsageDatabase
               PRIMARY KEY (client_id, request_id)
             );
             CREATE INDEX IF NOT EXISTS ix_usage_bucket ON usage(bucket_utc);
+            CREATE TABLE IF NOT EXISTS project_names (
+              client_id TEXT NOT NULL,
+              project_id TEXT NOT NULL,
+              project_name TEXT NOT NULL,
+              updated_utc TEXT NOT NULL,
+              PRIMARY KEY (client_id, project_id)
+            );
             """;
         await command.ExecuteNonQueryAsync();
+        var columns = connection.CreateCommand();
+        columns.CommandText = "PRAGMA table_info(usage)";
+        var hasProjectId = false;
+        await using (var reader = await columns.ExecuteReaderAsync())
+            while (await reader.ReadAsync()) hasProjectId |= string.Equals(reader.GetString(1), "project_id", StringComparison.OrdinalIgnoreCase);
+        if (!hasProjectId)
+        {
+            var migrate = connection.CreateCommand();
+            migrate.CommandText = "ALTER TABLE usage ADD COLUMN project_id TEXT NULL";
+            await migrate.ExecuteNonQueryAsync();
+        }
     }
 
     public static async Task<DatabaseResult> ReplaceAndSummarizeAsync(string path, string clientId, SyncPayload payload, string requestId)
@@ -285,12 +327,13 @@ internal static class UsageDatabase
                     var insert = connection.CreateCommand();
                     insert.Transaction = (SqliteTransaction)transaction;
                     insert.CommandText = """
-                        INSERT INTO usage(client_id,bucket_utc,project,model,input_tokens,cached_tokens,output_tokens,reasoning_tokens,responses)
-                        VALUES($client,$bucket,$project,$model,$input,$cached,$output,$reasoning,$responses)
+                        INSERT INTO usage(client_id,bucket_utc,project,project_id,model,input_tokens,cached_tokens,output_tokens,reasoning_tokens,responses)
+                        VALUES($client,$bucket,$project,$projectId,$model,$input,$cached,$output,$reasoning,$responses)
                         """;
                     insert.Parameters.AddWithValue("$client", clientId);
                     insert.Parameters.AddWithValue("$bucket", row.BucketStartUtc.ToString("O"));
                     insert.Parameters.AddWithValue("$project", row.Project);
+                    insert.Parameters.AddWithValue("$projectId", (object?)row.ProjectId ?? DBNull.Value);
                     insert.Parameters.AddWithValue("$model", row.Model);
                     insert.Parameters.AddWithValue("$input", row.Tokens.Input);
                     insert.Parameters.AddWithValue("$cached", row.Tokens.CachedInput);
@@ -298,6 +341,21 @@ internal static class UsageDatabase
                     insert.Parameters.AddWithValue("$reasoning", row.Tokens.Reasoning);
                     insert.Parameters.AddWithValue("$responses", row.Tokens.Responses);
                     await insert.ExecuteNonQueryAsync();
+                    if (!string.IsNullOrWhiteSpace(row.ProjectId) && !string.Equals(row.Project, row.ProjectId, StringComparison.Ordinal))
+                    {
+                        var rememberName = connection.CreateCommand();
+                        rememberName.Transaction = (SqliteTransaction)transaction;
+                        rememberName.CommandText = """
+                            INSERT INTO project_names(client_id,project_id,project_name,updated_utc)
+                            VALUES($client,$projectId,$project,$updated)
+                            ON CONFLICT(client_id,project_id) DO UPDATE SET project_name=excluded.project_name, updated_utc=excluded.updated_utc
+                            """;
+                        rememberName.Parameters.AddWithValue("$client", clientId);
+                        rememberName.Parameters.AddWithValue("$projectId", row.ProjectId);
+                        rememberName.Parameters.AddWithValue("$project", row.Project);
+                        rememberName.Parameters.AddWithValue("$updated", DateTime.UtcNow.ToString("O"));
+                        await rememberName.ExecuteNonQueryAsync();
+                    }
                 }
             }
             var remember = connection.CreateCommand();
@@ -329,6 +387,49 @@ internal static class UsageDatabase
             machines[reader.GetString(0)] = new TokenCounts(reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5));
         var combined = new TokenCounts(machines.Values.Sum(v => v.Input), machines.Values.Sum(v => v.CachedInput),
             machines.Values.Sum(v => v.Output), machines.Values.Sum(v => v.Reasoning), machines.Values.Sum(v => v.Responses));
-        return new DatabaseResult(duplicate, combined, machines);
+
+        var queryStart = payload.QueryStartUtc ?? payload.CombinedStartUtc;
+        var queryEnd = payload.QueryEndUtc ?? payload.CombinedEndUtc;
+        var storedRows = new Dictionary<string, List<AggregateRow>>(StringComparer.OrdinalIgnoreCase);
+        var rowQuery = connection.CreateCommand();
+        rowQuery.CommandText = """
+            SELECT u.client_id, u.bucket_utc, u.model, COALESCE(n.project_name,u.project),
+                   u.input_tokens, u.cached_tokens, u.output_tokens, u.reasoning_tokens, u.responses,
+                   COALESCE(u.project_id, CASE WHEN u.project LIKE 'Project ________' THEN u.project END)
+            FROM usage u
+            LEFT JOIN project_names n ON n.client_id=u.client_id AND n.project_id=COALESCE(u.project_id,u.project)
+            WHERE u.bucket_utc >= $start AND u.bucket_utc < $end
+            ORDER BY u.bucket_utc, u.client_id, u.project, u.model
+            """;
+        rowQuery.Parameters.AddWithValue("$start", queryStart.ToString("O"));
+        rowQuery.Parameters.AddWithValue("$end", queryEnd.ToString("O"));
+        await using var rowReader = await rowQuery.ExecuteReaderAsync();
+        while (await rowReader.ReadAsync())
+        {
+            var owner = rowReader.GetString(0);
+            if (!storedRows.TryGetValue(owner, out var ownerRows)) storedRows[owner] = ownerRows = [];
+            ownerRows.Add(new AggregateRow(
+                DateTime.Parse(rowReader.GetString(1), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                rowReader.GetString(2), rowReader.GetString(3),
+                new TokenCounts(rowReader.GetInt64(4), rowReader.GetInt64(5), rowReader.GetInt64(6),
+                    rowReader.GetInt64(7), rowReader.GetInt64(8)))
+                { ProjectId = rowReader.IsDBNull(9) ? null : rowReader.GetString(9) });
+        }
+        var combinedRows = storedRows.Values.SelectMany(rows => rows)
+            .GroupBy(row => new { row.BucketStartUtc, row.Model, row.Project, row.ProjectId })
+            .Select(group => new AggregateRow(group.Key.BucketStartUtc, group.Key.Model, group.Key.Project,
+                Sum(group.Select(row => row.Tokens))) { ProjectId = group.Key.ProjectId })
+            .OrderBy(row => row.BucketStartUtc).ThenBy(row => row.Project).ThenBy(row => row.Model)
+            .ToArray();
+        return new DatabaseResult(duplicate, combined, machines, combinedRows,
+            storedRows.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<AggregateRow>)pair.Value,
+                StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static TokenCounts Sum(IEnumerable<TokenCounts> values)
+    {
+        var rows = values.ToArray();
+        return new TokenCounts(rows.Sum(v => v.Input), rows.Sum(v => v.CachedInput), rows.Sum(v => v.Output),
+            rows.Sum(v => v.Reasoning), rows.Sum(v => v.Responses));
     }
 }

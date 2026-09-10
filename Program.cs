@@ -55,7 +55,8 @@ internal static class Program
     private static extern bool AttachConsole(uint processId);
 }
 
-internal sealed record UsagePoint(DateTime Time, string Model, string Project, long Input, long Cached, long Output, long Reasoning)
+internal sealed record UsagePoint(DateTime Time, string Model, string Project, long Input, long Cached, long Output, long Reasoning,
+    long Responses = 1)
 {
     public long Total => Input + Output;
 }
@@ -67,6 +68,7 @@ internal sealed record UsageSnapshot(DateTime Day, DateTime RefreshedAt, IReadOn
     public long Cached => Points.Sum(p => p.Cached);
     public long Output => Points.Sum(p => p.Output);
     public long Reasoning => Points.Sum(p => p.Reasoning);
+    public long Responses => Points.Sum(p => p.Responses);
 }
 
 internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects);
@@ -329,6 +331,29 @@ internal static class HistoryStore
     public static bool ShouldAutoBuild(HistoryCache? cache) =>
         cache is null || cache.FormatVersion < 4 ||
         (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
+
+    public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
+    {
+        var points = rows.Select(row => new UsagePoint(row.BucketStartUtc.ToLocalTime(), row.Model, row.Project,
+            row.Tokens.Input, row.Tokens.CachedInput, row.Tokens.Output, row.Tokens.Reasoning, row.Tokens.Responses)).ToArray();
+        var start = DateTime.Today.AddDays(-29);
+        var byDay = points.GroupBy(point => point.Time.Date).ToDictionary(group => group.Key, group => group.ToArray());
+        var days = Enumerable.Range(0, 30).Select(offset => start.AddDays(offset)).Select(date =>
+        {
+            var dayPoints = byDay.GetValueOrDefault(date) ?? [];
+            var hours = Enumerable.Range(0, 24).Select(hour =>
+            {
+                var hourPoints = dayPoints.Where(point => point.Time.Hour == hour).ToArray();
+                return new HourlyUsage(hour, hourPoints.Sum(point => point.Total),
+                    hourPoints.GroupBy(point => point.Model).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
+                    hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
+            }).ToArray();
+            return new DailyUsage(date, dayPoints.Sum(point => point.Total),
+                dayPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)), hours);
+        }).ToArray();
+        var todayPoints = byDay.GetValueOrDefault(DateTime.Today) ?? [];
+        return (new UsageSnapshot(DateTime.Today, DateTime.Now, todayPoints, 0), new HistoryCache(DateTime.Now, days));
+    }
 }
 
 internal sealed record ThemePalette(
@@ -375,7 +400,8 @@ internal sealed record DashboardSettings(
     string ClientId = "",
     string NetworkSalt = "",
     string ProtectedNetworkKey = "",
-    string NetworkProjectMode = "anonymous");
+    string NetworkProjectMode = "anonymous",
+    string NetworkView = "All machines");
 
 internal static class SettingsStore
 {
@@ -419,6 +445,8 @@ internal sealed class DashboardForm : Form
     };
     private readonly Button refresh = MakeButton("↻  Refresh now", 126, ThemeCatalog.Current.Primary);
     private readonly Button rebuild = MakeButton("◷  Rebuild 30 days", 158, ThemeCatalog.Current.Secondary);
+    private readonly Button view = MakeButton("◉  This PC", 150, ThemeCatalog.Current.Tertiary);
+    private readonly ToolTip viewToolTip = new() { ShowAlways = true };
     private readonly Button settings = MakeButton("⚙", 42, ThemeCatalog.Current.Tertiary);
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 5 * 60 * 1000 };
     private readonly System.Windows.Forms.Timer snapshotTimer = new();
@@ -432,6 +460,8 @@ internal sealed class DashboardForm : Form
     private Label titleLabel = null!;
     private DashboardSettings appSettings = new();
     private NetworkSyncState networkState = NetworkReporter.LoadState();
+    private UsageSnapshot? localSnapshot;
+    private HistoryCache? localHistory;
 
     public DashboardForm()
     {
@@ -477,24 +507,28 @@ internal sealed class DashboardForm : Form
         status.Location = new Point(header.Width - 560, 22);
         refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         rebuild.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        view.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         settings.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         void LayoutHeader()
         {
             settings.Left = header.ClientSize.Width - settings.Width - 34;
             rebuild.Left = settings.Left - rebuild.Width - 10;
             refresh.Left = rebuild.Left - refresh.Width - 10;
-            status.Left = Math.Max(titleLabel.Right + 20, refresh.Left - status.Width - 18);
-            refresh.Top = rebuild.Top = settings.Top = (header.ClientSize.Height - refresh.Height) / 2;
+            view.Left = refresh.Left - view.Width - 10;
+            status.Width = Math.Clamp(view.Left - titleLabel.Right - 38, 80, 245);
+            status.Left = view.Left - status.Width - 18;
+            refresh.Top = rebuild.Top = view.Top = settings.Top = (header.ClientSize.Height - refresh.Height) / 2;
             status.Top = (header.ClientSize.Height - status.Height) / 2;
         }
         header.Resize += (_, _) => LayoutHeader();
-        header.Controls.AddRange([titleLabel, status, refresh, rebuild, settings]);
+        header.Controls.AddRange([titleLabel, status, view, refresh, rebuild, settings]);
         LayoutHeader();
         Controls.Add(canvas);
         Controls.Add(header);
 
         refresh.Click += async (_, _) => await RefreshDataAsync();
         rebuild.Click += async (_, _) => await RebuildHistoryAsync();
+        view.Click += (_, _) => CycleNetworkView();
         settings.Click += async (_, _) => await ShowSettingsDialogAsync();
         timer.Tick += async (_, _) => await RefreshDataAsync();
         snapshotTimer.Tick += (_, _) => ExportSnapshot();
@@ -506,6 +540,7 @@ internal sealed class DashboardForm : Form
         };
         FormClosed += (_, _) => { refreshCts?.Cancel(); snapshotTimer.Stop(); };
         canvas.NetworkState = networkState;
+        view.Visible = appSettings.NetworkEnabled;
         ApplyTheme();
     }
 
@@ -521,17 +556,17 @@ internal sealed class DashboardForm : Form
             var snapshot = await LogScanner.ScanTodayAsync(refreshCts.Token, appSettings.SessionsFolder);
             while (snapshot.Day.Date != DateTime.Today)
                 snapshot = await LogScanner.ScanTodayAsync(refreshCts.Token, appSettings.SessionsFolder);
-            canvas.Snapshot = snapshot;
-            canvas.History ??= HistoryStore.Load();
-            if (canvas.History is { } history)
+            localSnapshot = snapshot;
+            localHistory ??= HistoryStore.Load();
+            if (localHistory is { } history)
             {
-                canvas.History = HistoryStore.MergeToday(history, snapshot);
-                HistoryStore.Save(canvas.History);
+                localHistory = HistoryStore.MergeToday(history, snapshot);
+                HistoryStore.Save(localHistory);
             }
-            canvas.Invalidate();
+            ApplySelectedView();
             lastRefreshedAt = snapshot.RefreshedAt;
             UpdateRefreshStatus();
-            if (HistoryStore.ShouldAutoBuild(canvas.History)) await RebuildHistoryAsync(true);
+            if (HistoryStore.ShouldAutoBuild(localHistory)) await RebuildHistoryAsync(true);
             await SyncNetworkAsync(false);
         }
         catch (OperationCanceledException) { }
@@ -699,6 +734,7 @@ internal sealed class DashboardForm : Form
         ThemeCatalog.Select(appSettings.Theme);
         ConfigureSnapshotTimer();
         ApplyTheme();
+        ApplySelectedView();
         UpdateRefreshStatus();
 
         if (!string.Equals(previous.SessionsFolder, appSettings.SessionsFolder, StringComparison.OrdinalIgnoreCase))
@@ -786,10 +822,52 @@ internal sealed class DashboardForm : Form
         {
             networkState = await NetworkReporter.SyncAsync(appSettings, forceFull, refreshCts?.Token ?? CancellationToken.None);
             canvas.NetworkState = networkState;
-            canvas.Invalidate();
+            ApplySelectedView();
             if (forceFull) status.Text = networkState.LastStatus;
         }
         finally { isNetworkSyncing = false; }
+    }
+
+    private string[] AvailableViews()
+    {
+        IEnumerable<string> machines = networkState.MachineRows?.Keys.OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase)
+            ?? Enumerable.Empty<string>();
+        return ["This PC", "All machines", .. machines];
+    }
+
+    private void CycleNetworkView()
+    {
+        var options = AvailableViews();
+        var current = Array.FindIndex(options, option => string.Equals(option, appSettings.NetworkView, StringComparison.OrdinalIgnoreCase));
+        appSettings = appSettings with { NetworkView = options[(current + 1 + options.Length) % options.Length] };
+        SettingsStore.Save(appSettings);
+        ApplySelectedView();
+    }
+
+    private void ApplySelectedView()
+    {
+        var options = AvailableViews();
+        var selected = options.FirstOrDefault(option => string.Equals(option, appSettings.NetworkView, StringComparison.OrdinalIgnoreCase))
+            ?? "This PC";
+        if (!appSettings.NetworkEnabled || networkState.Rows is null)
+            selected = "This PC";
+
+        UsageSnapshot? snapshot = localSnapshot;
+        HistoryCache? history = localHistory;
+        if (selected == "All machines" && networkState.Rows is { } allRows)
+            (snapshot, history) = HistoryStore.FromAggregates(allRows);
+        else if (networkState.MachineRows?.FirstOrDefault(pair => string.Equals(pair.Key, selected, StringComparison.OrdinalIgnoreCase))
+                     is { Key.Length: > 0 } machine)
+            (snapshot, history) = HistoryStore.FromAggregates(machine.Value);
+
+        canvas.Snapshot = snapshot;
+        canvas.History = history;
+        canvas.NetworkState = appSettings.NetworkEnabled ? networkState : null;
+        canvas.SourceLabel = selected;
+        view.Text = $"◉  {selected}";
+        viewToolTip.SetToolTip(view, selected);
+        view.Visible = appSettings.NetworkEnabled;
+        canvas.Invalidate();
     }
 
     private void ApplyTheme()
@@ -802,6 +880,7 @@ internal sealed class DashboardForm : Form
         canvas.BackColor = Bg;
         ((NeonButton)refresh).SetAccent(Theme.Primary);
         ((NeonButton)rebuild).SetAccent(Theme.Secondary);
+        ((NeonButton)view).SetAccent(Theme.Tertiary);
         ((NeonButton)settings).SetAccent(Theme.Tertiary);
         Invalidate(true);
     }
@@ -1491,8 +1570,8 @@ internal sealed class DashboardForm : Form
             var history = await LogScanner.ScanHistoryAsync(
                 30, refreshCts?.Token ?? CancellationToken.None, appSettings.SessionsFolder);
             HistoryStore.Save(history);
-            canvas.History = history;
-            canvas.Invalidate();
+            localHistory = history;
+            ApplySelectedView();
             status.Text = $"30-day history built {history.BuiltAt:h:mm tt}";
             await SyncNetworkAsync(true);
         }
@@ -1551,8 +1630,11 @@ internal sealed class DashboardForm : Form
             using var edge = new Pen(Color.FromArgb(hovering ? 245 : 190, accent), 1.35f);
             g.DrawPath(glow, path);
             g.DrawPath(edge, path);
-            TextRenderer.DrawText(g, Text, Font, ClientRectangle, ForeColor,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            var horizontalPadding = Width <= 50 ? 3 : 10;
+            var textBounds = Rectangle.Inflate(bounds, -horizontalPadding, -2);
+            TextRenderer.DrawText(g, Text, Font, textBounds, ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.PreserveGraphicsClipping);
         }
 
         private static GraphicsPath ButtonPath(Rectangle r, int radius)
@@ -1589,6 +1671,9 @@ internal sealed class DashboardForm : Form
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public NetworkSyncState? NetworkState { get; set; }
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string SourceLabel { get; set; } = "This PC";
 
         public UsageCanvas()
         {
@@ -1712,13 +1797,13 @@ internal sealed class DashboardForm : Form
             StrokeRound(g, chart, 22, Color.FromArgb(45, Theme.Primary));
             StrokeRound(g, projects, 22, Color.FromArgb(45, Theme.Tertiary));
             StrokeRound(g, history, 22, Color.FromArgb(45, Theme.Secondary));
-            DrawHero(g, hero, Snapshot, NetworkState);
+            DrawHero(g, hero, Snapshot, NetworkState, SourceLabel);
             DrawChart(g, chart, Snapshot, History, pinnedDate);
             DrawProjects(g, projects, Snapshot, History, hoveredDate, hoveredHour, pinnedDate, hideProjectNames);
             DrawHistory(g, history, History);
         }
 
-        private static void DrawHero(Graphics g, Rectangle r, UsageSnapshot s, NetworkSyncState? network)
+        private static void DrawHero(Graphics g, Rectangle r, UsageSnapshot s, NetworkSyncState? network, string sourceLabel)
         {
             using var label = new Font("Segoe UI Semibold", 10f);
             using var value = new Font("Segoe UI Variable Display", 37f, FontStyle.Bold);
@@ -1743,13 +1828,17 @@ internal sealed class DashboardForm : Form
                 g.DrawString(Compact(item.Item2), metric, new SolidBrush(TextMain), x, r.Y + 82);
                 x += width;
             }
-            if (network?.Combined is { } combined && network.LastSuccessUtc is { } received)
+            if (!string.Equals(sourceLabel, "All machines", StringComparison.OrdinalIgnoreCase) &&
+                network?.Combined is { } combined && network.LastSuccessUtc is { } received)
             {
                 using var global = new Font("Segoe UI Semibold", 9f);
                 g.DrawString($"ALL MACHINES  {Compact(combined.Total)}  ·  synced {received.ToLocalTime():h:mm tt}", global,
                     new SolidBrush(Theme.Tertiary), r.X + 29, r.Bottom - 61);
             }
-            g.DrawString($"{s.Points.Count:N0} responses across {s.FilesScanned:N0} log files", small,
+            var detail = string.Equals(sourceLabel, "This PC", StringComparison.OrdinalIgnoreCase)
+                ? $"{s.Responses:N0} responses across {s.FilesScanned:N0} log files"
+                : $"{s.Responses:N0} responses  ·  {sourceLabel}";
+            g.DrawString(detail, small,
                 new SolidBrush(TextMuted), r.X + 29, r.Bottom - 38);
         }
 

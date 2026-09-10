@@ -11,7 +11,9 @@ internal sealed record NetworkSyncState(
     DateTime? LastFullSyncDate = null,
     string LastStatus = "Not connected",
     TokenCounts? Combined = null,
-    IReadOnlyDictionary<string, TokenCounts>? Machines = null);
+    IReadOnlyDictionary<string, TokenCounts>? Machines = null,
+    IReadOnlyList<AggregateRow>? Rows = null,
+    IReadOnlyDictionary<string, IReadOnlyList<AggregateRow>>? MachineRows = null);
 
 internal static class NetworkReporter
 {
@@ -52,8 +54,8 @@ internal static class NetworkReporter
     {
         var now = DateTime.UtcNow;
         var hour = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc);
-        var payload = new SyncPayload("query", settings.MachineName, hour, hour.AddHours(1),
-            DateTime.Today.ToUniversalTime(), DateTime.Today.AddDays(1).ToUniversalTime(), []);
+        var payload = WithDashboardRange(new SyncPayload("query", settings.MachineName, hour, hour.AddHours(1),
+            DateTime.Today.ToUniversalTime(), DateTime.Today.AddDays(1).ToUniversalTime(), []));
         return await ExchangeAsync(settings, payload, false, token);
     }
 
@@ -84,8 +86,8 @@ internal static class NetworkReporter
             rows = ApplyProjectPrivacy(rows, settings.NetworkProjectMode, key);
         }
         finally { CryptographicOperations.ZeroMemory(key); }
-        var payload = new SyncPayload(full ? "full" : "incremental", settings.MachineName, startUtc, endUtc,
-            DateTime.Today.ToUniversalTime(), DateTime.Today.AddDays(1).ToUniversalTime(), rows);
+        var payload = WithDashboardRange(new SyncPayload(full ? "full" : "incremental", settings.MachineName, startUtc, endUtc,
+            DateTime.Today.ToUniversalTime(), DateTime.Today.AddDays(1).ToUniversalTime(), rows));
         return await ExchangeAsync(settings, payload, full, token);
     }
 
@@ -119,7 +121,9 @@ internal static class NetworkReporter
                 payload.Kind == "query" ? "Encrypted connection verified" :
                     full ? "Full reconciliation complete" : "Incremental sync complete",
                 reply.Combined,
-                reply.Machines);
+                reply.Machines,
+                reply.Rows,
+                reply.MachineRows);
             SaveState(state);
             return state;
         }
@@ -136,15 +140,19 @@ internal static class NetworkReporter
     private static IReadOnlyList<AggregateRow> ApplyProjectPrivacy(
         IReadOnlyList<AggregateRow> rows, string mode, ReadOnlySpan<byte> key)
     {
-        if (string.Equals(mode, "names", StringComparison.OrdinalIgnoreCase)) return rows;
         if (string.Equals(mode, "none", StringComparison.OrdinalIgnoreCase))
             return rows.GroupBy(row => new { row.BucketStartUtc, row.Model }).Select(group => new AggregateRow(
                 group.Key.BucketStartUtc, group.Key.Model, "All projects", Sum(group.Select(row => row.Tokens)))).ToArray();
 
         using var hmac = new HMACSHA256(key.ToArray());
-        return rows.Select(row => row with
+        return rows.Select(row =>
         {
-            Project = "Project " + Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(row.Project)))[..8]
+            var projectId = "Project " + Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(row.Project)))[..8];
+            return row with
+            {
+                Project = string.Equals(mode, "names", StringComparison.OrdinalIgnoreCase) ? row.Project : projectId,
+                ProjectId = projectId
+            };
         }).ToArray();
     }
 
@@ -167,6 +175,12 @@ internal static class NetworkReporter
         if (!normalized.EndsWith('/')) normalized += "/";
         return new HttpClient { BaseAddress = new Uri(normalized, UriKind.Absolute), Timeout = TimeSpan.FromSeconds(20) };
     }
+
+    private static SyncPayload WithDashboardRange(SyncPayload payload) => payload with
+    {
+        QueryStartUtc = DateTime.Today.AddDays(-29).ToUniversalTime(),
+        QueryEndUtc = DateTime.Today.AddDays(1).ToUniversalTime()
+    };
 
     private static void SaveState(NetworkSyncState state)
     {
