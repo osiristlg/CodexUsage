@@ -848,7 +848,8 @@ internal sealed class DashboardForm : Form
     private void ExportSnapshot()
     {
         if (!appSettings.SnapshotEnabled || string.IsNullOrWhiteSpace(appSettings.SnapshotFolder) ||
-            canvas.Snapshot is null || canvas.Snapshot.Day.Date != DateTime.Today) return;
+            canvas.Snapshot is null || canvas.Snapshot.Day.Date != DateTime.Today ||
+            WindowState == FormWindowState.Minimized || canvas.ClientSize.Width <= 0 || canvas.ClientSize.Height <= 0) return;
         string? temporaryPath = null;
         try
         {
@@ -1893,6 +1894,7 @@ internal sealed class DashboardForm : Form
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
+            if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
             Render(e.Graphics, false);
         }
 
