@@ -2081,15 +2081,46 @@ internal sealed class DashboardForm : Form
                 g.DrawRectangle(columnEdge, x + 1, plot.Top, barSlot - 2, plot.Height);
 
                 var barTop = plot.Bottom - totals[selectedHour] / (float)niceMax * plot.Height;
+                var activeModels = models.Select((model, index) => new
+                    {
+                        model.Key,
+                        Tokens = hourly[index][selectedHour],
+                        Color = Palette[index % Palette.Length]
+                    })
+                    .Where(model => model.Tokens > 0)
+                    .ToArray();
+                var maxVisibleModels = Math.Max(1, (plot.Height - 70) / 18);
+                var visibleModels = activeModels.Take(maxVisibleModels).ToArray();
+                var hiddenModelCount = activeModels.Length - visibleModels.Length;
+                const int tooltipWidth = 230;
+                var tooltipHeight = 47 + (visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0)) * 18;
                 var tooltip = new Rectangle(
-                    Math.Clamp((int)(x + barSlot / 2) - 86, plot.Left, plot.Right - 172),
-                    Math.Max(plot.Top + 5, (int)barTop - 58), 172, 46);
+                    Math.Clamp((int)(x + barSlot / 2) - tooltipWidth / 2, plot.Left, plot.Right - tooltipWidth),
+                    Math.Clamp((int)barTop - tooltipHeight - 8, plot.Top + 5, plot.Bottom - tooltipHeight - 5),
+                    tooltipWidth, tooltipHeight);
                 FillRound(g, tooltip, 8, Darken(Panel, 4));
                 StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
                 using var tipLabel = new Font("Segoe UI Semibold", 8.5f);
                 using var tipValue = new Font("Segoe UI Semibold", 10f);
                 g.DrawString(HourRange(selectedHour), tipLabel, new SolidBrush(TextMuted), tooltip.X + 9, tooltip.Y + 5);
                 g.DrawString($"{totals[selectedHour]:N0} tokens", tipValue, new SolidBrush(TextMain), tooltip.X + 9, tooltip.Y + 21);
+                for (var i = 0; i < visibleModels.Length; i++)
+                {
+                    var model = visibleModels[i];
+                    var rowY = tooltip.Y + 47 + i * 18;
+                    using var dot = new SolidBrush(model.Color);
+                    g.FillEllipse(dot, tooltip.X + 10, rowY + 4, 7, 7);
+                    var value = model.Tokens.ToString("N0");
+                    var valueSize = g.MeasureString(value, tipLabel);
+                    var nameBounds = new Rectangle(tooltip.X + 24, rowY, tooltip.Width - 41 - (int)valueSize.Width, 16);
+                    TextRenderer.DrawText(g, model.Key, tipLabel, nameBounds, TextMuted,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
+                        TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+                    g.DrawString(value, tipLabel, new SolidBrush(TextMain), tooltip.Right - valueSize.Width - 10, rowY);
+                }
+                if (hiddenModelCount > 0)
+                    g.DrawString($"+ {hiddenModelCount} more model{(hiddenModelCount == 1 ? "" : "s")}", tipLabel,
+                        new SolidBrush(TextMuted), tooltip.X + 24, tooltip.Y + 47 + visibleModels.Length * 18);
             }
             foreach (var h in new[] { 0, 4, 8, 12, 16, 20, 23 })
             {
