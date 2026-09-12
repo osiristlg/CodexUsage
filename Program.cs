@@ -1408,6 +1408,7 @@ internal sealed class DashboardForm : Form
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
+            if (ClientSize.Width <= 5 || ClientSize.Height <= 5) return;
             using var glow = new Pen(Color.FromArgb(70, Theme.Primary), 6f);
             using var edge = new Pen(Color.FromArgb(235, Theme.Primary), 1.5f);
             var bounds = new Rectangle(2, 2, ClientSize.Width - 5, ClientSize.Height - 5);
@@ -1596,6 +1597,7 @@ internal sealed class DashboardForm : Form
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (ClientSize.Width <= 5 || ClientSize.Height <= 7) return;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var bounds = new Rectangle(2, 3, Width - 5, Height - 7);
             using var path = Rounded(bounds, 7);
@@ -1653,6 +1655,7 @@ internal sealed class DashboardForm : Form
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (ClientSize.Width <= 4 || ClientSize.Height <= 8) return;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.Clear(Parent?.BackColor ?? Theme.Panel);
             var track = new Rectangle(2, 4, Width - 4, Height - 8);
@@ -1766,6 +1769,7 @@ internal sealed class DashboardForm : Form
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            if (ClientSize.Width <= 11 || ClientSize.Height <= 11) return;
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Parent?.BackColor ?? Bg);
@@ -1923,6 +1927,7 @@ internal sealed class DashboardForm : Form
 
         private void Render(Graphics g, bool hideProjectNames)
         {
+            if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
             using (var background = new LinearGradientBrush(ClientRectangle,
