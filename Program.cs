@@ -2093,10 +2093,10 @@ internal sealed class DashboardForm : Form
                 var visibleModels = activeModels.Take(maxVisibleModels).ToArray();
                 var hiddenModelCount = activeModels.Length - visibleModels.Length;
                 const int tooltipWidth = 230;
-                var tooltipHeight = 47 + (visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0)) * 18;
+                var tooltipHeight = 54 + (visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0)) * 18;
                 var tooltip = new Rectangle(
                     Math.Clamp((int)(x + barSlot / 2) - tooltipWidth / 2, plot.Left, plot.Right - tooltipWidth),
-                    Math.Clamp((int)barTop - tooltipHeight - 8, plot.Top + 5, plot.Bottom - tooltipHeight - 5),
+                    Math.Clamp((int)barTop - tooltipHeight - 14, plot.Top - 8, plot.Bottom - tooltipHeight - 5),
                     tooltipWidth, tooltipHeight);
                 FillRound(g, tooltip, 8, Darken(Panel, 4));
                 StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
