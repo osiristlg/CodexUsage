@@ -66,11 +66,15 @@ public sealed class ProtocolTests
             """;
         var legacy = JsonSerializer.Deserialize<AggregateRow>(legacyJson, options)!;
         Assert.Null(legacy.ProjectId);
+        Assert.Null(legacy.Effort);
         Assert.DoesNotContain("projectId", JsonSerializer.Serialize(legacy, options));
+        Assert.DoesNotContain("effort", JsonSerializer.Serialize(legacy, options));
 
-        var identified = legacy with { ProjectId = "Project A1B2C3D4" };
+        var identified = legacy with { ProjectId = "Project A1B2C3D4", Effort = "High" };
         Assert.Equal("Project A1B2C3D4", JsonSerializer.Deserialize<AggregateRow>(
             JsonSerializer.Serialize(identified, options), options)!.ProjectId);
+        Assert.Equal("High", JsonSerializer.Deserialize<AggregateRow>(
+            JsonSerializer.Serialize(identified, options), options)!.Effort);
     }
 
     private static SyncPayload SamplePayload() => new(

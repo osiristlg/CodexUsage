@@ -6,6 +6,7 @@ public struct UsagePoint: Codable, Sendable {
     public var model: String
     public var project: String
     public var tokens: Tokens
+    public var effort: String?
 }
 public struct ScanResult: Sendable {
     public var points: [UsagePoint] = []
@@ -69,6 +70,8 @@ public enum LogScanner {
         var fallback = "Unknown model"
         var project = "Projectless"
         var models: [String: String] = [:]
+        var effort = "Unknown"
+        var efforts: [String: String] = [:]
         var counts: [UsagePoint] = []
         var records: [UsagePoint] = []
         var malformed = 0
@@ -87,34 +90,52 @@ public enum LogScanner {
                 return
             }
             if type == "turn_context" {
-                if let turn = p["turn_id"] as? String, let value = p["model"] as? String {
-                    model = friendly(value); models[turn.lowercased()] = model
-                }
+                let turn = (p["turn_id"] as? String ?? "").lowercased()
+                if let value = p["model"] as? String { model = friendly(value); if !turn.isEmpty { models[turn] = model } }
+                effort = friendlyEffort(readEffort(p))
+                if !turn.isEmpty { efforts[turn] = effort }
                 return
             }
             guard let ts = root["timestamp"] as? String, let time = WireTime.date(ts) else { malformed += 1; return }
             guard time >= start && time < end else { return }
             if type == "event_msg", p["type"] as? String == "token_count",
                let info = p["info"] as? [String: Any], let usage = info["last_token_usage"] as? [String: Any] {
-                counts.append(point(time, model, usage))
+                counts.append(point(time, model, effort, usage))
             } else if type == "token_usage_record", let usage = p["usage"] as? [String: Any] {
                 let turn = (p["turn_id"] as? String ?? "").lowercased()
-                records.append(point(time, models[turn] ?? fallback, usage))
+                records.append(point(time, models[turn] ?? fallback, efforts[turn] ?? "Unknown", usage))
             }
         }
-        func point(_ time: Date, _ model: String, _ usage: [String: Any]) -> UsagePoint {
+        func point(_ time: Date, _ model: String, _ effort: String, _ usage: [String: Any]) -> UsagePoint {
             func n(_ key: String) -> Int64 { max(0, (usage[key] as? NSNumber)?.int64Value ?? 0) }
             return UsagePoint(time: time, model: model, project: project,
                               tokens: Tokens(input: n("input_tokens"), cachedInput: n("cached_input_tokens"),
-                                             output: n("output_tokens"), reasoning: n("reasoning_output_tokens"), responses: 1))
+                                             output: n("output_tokens"), reasoning: n("reasoning_output_tokens"), responses: 1),
+                              effort: effort)
         }
         func friendly(_ value: String) -> String {
             value.replacingOccurrences(of: "gpt-", with: "GPT ", options: .caseInsensitive)
                 .replacingOccurrences(of: "codex", with: "Codex", options: .caseInsensitive)
         }
+        func readEffort(_ payload: [String: Any]) -> String? {
+            if let value = payload["reasoning_effort"] as? String { return value }
+            if let value = payload["effort"] as? String { return value }
+            if let mode = payload["collaboration_mode"] as? [String: Any],
+               let settings = mode["settings"] as? [String: Any] { return settings["reasoning_effort"] as? String }
+            return nil
+        }
+        func friendlyEffort(_ value: String?) -> String {
+            guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return "Unknown" }
+            switch raw.lowercased() {
+            case "low", "light", "minimal": return "Light"
+            case "medium": return "Medium"
+            case "high": return "High"
+            default: return raw.replacingOccurrences(of: "_", with: " ").capitalized
+            }
+        }
     }
     public static func aggregate(_ points: [UsagePoint], start: Date, end: Date, privacy: ProjectPrivacy = .names, key: Data = Data()) -> [AggregateRow] {
-        struct Bucket: Hashable { let time: String; let model: String; let project: String; let projectId: String? }
+        struct Bucket: Hashable { let time: String; let model: String; let project: String; let projectId: String?; let effort: String }
         func anonymousProject(_ project: String) -> String {
             let digest = HMAC<SHA256>.authenticationCode(for: Data(project.utf8), using: SymmetricKey(data: key))
             return "Project " + digest.prefix(4).map { String(format: "%02X", $0) }.joined()
@@ -132,12 +153,12 @@ public enum LogScanner {
             case .anonymous:
                 name = anonymousProject(p.project); projectId = name
             }
-            let bucket = Bucket(time: WireTime.string(hour), model: p.model, project: name, projectId: projectId)
+            let bucket = Bucket(time: WireTime.string(hour), model: p.model, project: name, projectId: projectId, effort: p.effort ?? "Unknown")
             buckets[bucket] = (buckets[bucket] ?? Tokens()) + p.tokens
         }
         return buckets.map { AggregateRow(bucketStartUtc: $0.key.time, model: $0.key.model, project: $0.key.project,
-                                          tokens: $0.value, projectId: $0.key.projectId) }
-            .sorted { ($0.bucketStartUtc, $0.project, $0.model) < ($1.bucketStartUtc, $1.project, $1.model) }
+                                          tokens: $0.value, projectId: $0.key.projectId, effort: $0.key.effort) }
+            .sorted { ($0.bucketStartUtc, $0.project, $0.model, $0.effort ?? "") < ($1.bucketStartUtc, $1.project, $1.model, $1.effort ?? "") }
     }
 }
 public enum ProjectPrivacy: String, Codable, Sendable, CaseIterable { case anonymous, none, names }

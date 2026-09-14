@@ -255,6 +255,7 @@ internal static class PayloadValidation
                 return "An aggregate bucket is outside the declared range or not hour-aligned.";
             if (row.Model.Length is < 1 or > 100 || row.Project.Length is < 1 or > 200) return "Invalid aggregate label.";
             if (row.ProjectId is { Length: < 1 or > 80 }) return "Invalid project identifier.";
+            if (row.Effort is { Length: < 1 or > 40 }) return "Invalid reasoning effort.";
             if (row.Tokens.Input < 0 || row.Tokens.CachedInput < 0 || row.Tokens.Output < 0 || row.Tokens.Reasoning < 0 || row.Tokens.Responses < 0)
                 return "Negative aggregate value.";
         }
@@ -292,12 +293,13 @@ internal static class UsageDatabase
               project TEXT NOT NULL,
               project_id TEXT NULL,
               model TEXT NOT NULL,
+              effort TEXT NOT NULL,
               input_tokens INTEGER NOT NULL,
               cached_tokens INTEGER NOT NULL,
               output_tokens INTEGER NOT NULL,
               reasoning_tokens INTEGER NOT NULL,
               responses INTEGER NOT NULL,
-              PRIMARY KEY (client_id, bucket_utc, project, model)
+              PRIMARY KEY (client_id, bucket_utc, project, model, effort)
             );
             CREATE TABLE IF NOT EXISTS requests (
               client_id TEXT NOT NULL,
@@ -318,12 +320,43 @@ internal static class UsageDatabase
         var columns = connection.CreateCommand();
         columns.CommandText = "PRAGMA table_info(usage)";
         var hasProjectId = false;
+        var hasEffort = false;
         await using (var reader = await columns.ExecuteReaderAsync())
-            while (await reader.ReadAsync()) hasProjectId |= string.Equals(reader.GetString(1), "project_id", StringComparison.OrdinalIgnoreCase);
+            while (await reader.ReadAsync())
+            {
+                hasProjectId |= string.Equals(reader.GetString(1), "project_id", StringComparison.OrdinalIgnoreCase);
+                hasEffort |= string.Equals(reader.GetString(1), "effort", StringComparison.OrdinalIgnoreCase);
+            }
         if (!hasProjectId)
         {
             var migrate = connection.CreateCommand();
             migrate.CommandText = "ALTER TABLE usage ADD COLUMN project_id TEXT NULL";
+            await migrate.ExecuteNonQueryAsync();
+        }
+        if (!hasEffort)
+        {
+            var migrate = connection.CreateCommand();
+            migrate.CommandText = """
+                CREATE TABLE usage_with_effort (
+                  client_id TEXT NOT NULL,
+                  bucket_utc TEXT NOT NULL,
+                  project TEXT NOT NULL,
+                  project_id TEXT NULL,
+                  model TEXT NOT NULL,
+                  effort TEXT NOT NULL,
+                  input_tokens INTEGER NOT NULL,
+                  cached_tokens INTEGER NOT NULL,
+                  output_tokens INTEGER NOT NULL,
+                  reasoning_tokens INTEGER NOT NULL,
+                  responses INTEGER NOT NULL,
+                  PRIMARY KEY (client_id, bucket_utc, project, model, effort)
+                );
+                INSERT INTO usage_with_effort(client_id,bucket_utc,project,project_id,model,effort,input_tokens,cached_tokens,output_tokens,reasoning_tokens,responses)
+                SELECT client_id,bucket_utc,project,project_id,model,'Unknown',input_tokens,cached_tokens,output_tokens,reasoning_tokens,responses FROM usage;
+                DROP TABLE usage;
+                ALTER TABLE usage_with_effort RENAME TO usage;
+                CREATE INDEX ix_usage_bucket ON usage(bucket_utc);
+                """;
             await migrate.ExecuteNonQueryAsync();
         }
     }
@@ -357,14 +390,15 @@ internal static class UsageDatabase
                     var insert = connection.CreateCommand();
                     insert.Transaction = (SqliteTransaction)transaction;
                     insert.CommandText = """
-                        INSERT INTO usage(client_id,bucket_utc,project,project_id,model,input_tokens,cached_tokens,output_tokens,reasoning_tokens,responses)
-                        VALUES($client,$bucket,$project,$projectId,$model,$input,$cached,$output,$reasoning,$responses)
+                        INSERT INTO usage(client_id,bucket_utc,project,project_id,model,effort,input_tokens,cached_tokens,output_tokens,reasoning_tokens,responses)
+                        VALUES($client,$bucket,$project,$projectId,$model,$effort,$input,$cached,$output,$reasoning,$responses)
                         """;
                     insert.Parameters.AddWithValue("$client", clientId);
                     insert.Parameters.AddWithValue("$bucket", row.BucketStartUtc.ToString("O"));
                     insert.Parameters.AddWithValue("$project", row.Project);
                     insert.Parameters.AddWithValue("$projectId", (object?)row.ProjectId ?? DBNull.Value);
                     insert.Parameters.AddWithValue("$model", row.Model);
+                    insert.Parameters.AddWithValue("$effort", row.Effort ?? "Unknown");
                     insert.Parameters.AddWithValue("$input", row.Tokens.Input);
                     insert.Parameters.AddWithValue("$cached", row.Tokens.CachedInput);
                     insert.Parameters.AddWithValue("$output", row.Tokens.Output);
@@ -423,7 +457,7 @@ internal static class UsageDatabase
         var storedRows = new Dictionary<string, List<AggregateRow>>(StringComparer.OrdinalIgnoreCase);
         var rowQuery = connection.CreateCommand();
         rowQuery.CommandText = """
-            SELECT u.client_id, u.bucket_utc, u.model, COALESCE(n.project_name,u.project),
+            SELECT u.client_id, u.bucket_utc, u.model, COALESCE(n.project_name,u.project), u.effort,
                    u.input_tokens, u.cached_tokens, u.output_tokens, u.reasoning_tokens, u.responses,
                    COALESCE(u.project_id, CASE WHEN u.project LIKE 'Project ________' THEN u.project END)
             FROM usage u
@@ -441,14 +475,14 @@ internal static class UsageDatabase
             ownerRows.Add(new AggregateRow(
                 DateTime.Parse(rowReader.GetString(1), null, System.Globalization.DateTimeStyles.RoundtripKind),
                 rowReader.GetString(2), rowReader.GetString(3),
-                new TokenCounts(rowReader.GetInt64(4), rowReader.GetInt64(5), rowReader.GetInt64(6),
-                    rowReader.GetInt64(7), rowReader.GetInt64(8)))
-                { ProjectId = rowReader.IsDBNull(9) ? null : rowReader.GetString(9) });
+                new TokenCounts(rowReader.GetInt64(5), rowReader.GetInt64(6), rowReader.GetInt64(7),
+                    rowReader.GetInt64(8), rowReader.GetInt64(9)))
+                { Effort = rowReader.GetString(4), ProjectId = rowReader.IsDBNull(10) ? null : rowReader.GetString(10) });
         }
         var combinedRows = storedRows.Values.SelectMany(rows => rows)
-            .GroupBy(row => new { row.BucketStartUtc, row.Model, row.Project, row.ProjectId })
+            .GroupBy(row => new { row.BucketStartUtc, row.Model, row.Project, row.ProjectId, row.Effort })
             .Select(group => new AggregateRow(group.Key.BucketStartUtc, group.Key.Model, group.Key.Project,
-                Sum(group.Select(row => row.Tokens))) { ProjectId = group.Key.ProjectId })
+                Sum(group.Select(row => row.Tokens))) { ProjectId = group.Key.ProjectId, Effort = group.Key.Effort })
             .OrderBy(row => row.BucketStartUtc).ThenBy(row => row.Project).ThenBy(row => row.Model)
             .ToArray();
         return new DatabaseResult(duplicate, combined, machines, combinedRows,

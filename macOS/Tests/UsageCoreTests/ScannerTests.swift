@@ -7,7 +7,7 @@ struct ScannerTests {
         let start = WireTime.date("2026-09-10T00:00:00Z")!
         let end = start.addingTimeInterval(86400)
         let metadata = #"{"type":"session_meta","payload":{"cwd":"/private/secret/Example"}}"# + "\n" +
-            #"{"type":"turn_context","payload":{"turn_id":"a","model":"gpt-5.6-sol"}}"# + "\n"
+            #"{"type":"turn_context","payload":{"turn_id":"a","model":"gpt-5.6-sol","reasoning_effort":"high"}}"# + "\n"
         let legacy = #"{"timestamp":"2026-09-10T12:15:00Z","type":"token_usage_record","payload":{"turn_id":"a","usage":{"input_tokens":100,"output_tokens":20}}}"#
         let event = #"{"timestamp":"2026-09-10T12:15:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20,"reasoning_output_tokens":5}}}}"#
         let result = LogScanner.parse(metadata + legacy + "\n" + event + "\n" + #"{"type":"token_usage_record","broken"#,
@@ -16,6 +16,7 @@ struct ScannerTests {
         expectEqual(result.malformedRecords, 1)
         expectEqual(result.points[0].tokens.total, 120)
         expectEqual(result.points[0].model, "GPT 5.6-sol")
+        expectEqual(result.points[0].effort, "High")
         expectEqual(LogScanner.parse(metadata + legacy, start: start, end: end).points.count, 1)
         expectEqual(LogScanner.parse(metadata + event, start: end, end: end.addingTimeInterval(86400)).points.count, 0)
         let key = Data(repeating: 1, count: 32)
@@ -23,6 +24,7 @@ struct ScannerTests {
         expectEqual(rows[0].bucketStartUtc, "2026-09-10T12:00:00Z")
         expectEqual(rows[0].project, "Project 32F458A8")
         expectEqual(rows[0].projectId, rows[0].project)
+        expectEqual(rows[0].effort, "High")
         let encoded = String(decoding: try JSONEncoder().encode(rows), as: UTF8.self)
         expectEqual(encoded.contains("Example"), false); expectEqual(encoded.contains("secret"), false)
         let named = LogScanner.aggregate(result.points, start: start, end: end, privacy: .names, key: key)

@@ -141,11 +141,12 @@ internal static class LogScanner
                 Bucket = new DateTime(point.Time.ToUniversalTime().Year, point.Time.ToUniversalTime().Month,
                     point.Time.ToUniversalTime().Day, point.Time.ToUniversalTime().Hour, 0, 0, DateTimeKind.Utc),
                 point.Model,
-                point.Project
+                point.Project,
+                point.Effort
             })
             .Select(group => new AggregateRow(group.Key.Bucket, group.Key.Model, group.Key.Project,
                 new TokenCounts(group.Sum(p => p.Input), group.Sum(p => p.Cached), group.Sum(p => p.Output),
-                    group.Sum(p => p.Reasoning), group.LongCount())))
+                    group.Sum(p => p.Reasoning), group.LongCount())) { Effort = group.Key.Effort })
             .OrderBy(row => row.BucketStartUtc).ThenBy(row => row.Project).ThenBy(row => row.Model)
             .ToArray();
     }, token);
@@ -366,7 +367,8 @@ internal static class HistoryStore
     public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
     {
         var points = rows.Select(row => new UsagePoint(row.BucketStartUtc.ToLocalTime(), row.Model, row.Project,
-            row.Tokens.Input, row.Tokens.CachedInput, row.Tokens.Output, row.Tokens.Reasoning, row.Tokens.Responses)).ToArray();
+            row.Tokens.Input, row.Tokens.CachedInput, row.Tokens.Output, row.Tokens.Reasoning, row.Tokens.Responses,
+            row.Effort ?? "Unknown")).ToArray();
         var start = DateTime.Today.AddDays(-29);
         var byDay = points.GroupBy(point => point.Time.Date).ToDictionary(group => group.Key, group => group.ToArray());
         var days = Enumerable.Range(0, 30).Select(offset => start.AddDays(offset)).Select(date =>
@@ -1168,7 +1170,7 @@ internal sealed class DashboardForm : Form
         private Control NetworkPage()
         {
             var page = NewPage("Network Reporting", "Encrypted aggregate reporting across your private network.");
-            var card = new Panel { Width = 630, Height = 356, BackColor = Shade(Theme.Panel, 2), Padding = new Padding(24) };
+            var card = new Panel { Width = 630, Height = 396, BackColor = Shade(Theme.Panel, 2), Padding = new Padding(24) };
             var badge = MakeLabel("AGGREGATES ONLY  /  RAW LOGS NEVER LEAVE THIS MACHINE", 8.5f, Theme.Tertiary, FontStyle.Bold);
             badge.Location = new Point(22, 18);
             AddNetworkRow(card, "REPORT TO RECEIVER", networkEnabled, 44);
@@ -1186,8 +1188,12 @@ internal sealed class DashboardForm : Form
             test.Size = new Size(132, 40);
             test.Location = new Point(20, 300);
             test.Click += async (_, _) => await TestConnectionAsync(test);
-            networkStatus.Location = new Point(166, 310);
-            networkStatus.MaximumSize = new Size(250, 36);
+            var upload = CompactButton("Force full upload", Theme.Secondary);
+            upload.Size = new Size(150, 40);
+            upload.Location = new Point(166, 300);
+            upload.Click += async (_, _) => await ForceFullUploadAsync(upload);
+            networkStatus.Location = new Point(20, 354);
+            networkStatus.MaximumSize = new Size(588, 36);
             var manage = CompactButton("Manage receiver clients", Theme.Tertiary);
             manage.Size = new Size(176, 40);
             manage.Location = new Point(432, 300);
@@ -1200,7 +1206,7 @@ internal sealed class DashboardForm : Form
                 networkStatus.Text = "Enter the matching passphrase on each rotated client.";
             };
             if (!manage.Enabled) manage.Text = "Receiver not on this PC";
-            card.Controls.AddRange([badge, test, networkStatus, manage]);
+            card.Controls.AddRange([badge, test, upload, networkStatus, manage]);
             page.Controls.Add(card);
             return page;
         }
@@ -1231,6 +1237,33 @@ internal sealed class DashboardForm : Form
                 var success = state.LastStatus == "Encrypted connection verified";
                 networkStatus.ForeColor = success ? Theme.Primary : Theme.Secondary;
                 networkStatus.Text = success ? "Encrypted connection verified" : state.LastStatus;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or InvalidDataException or CryptographicException or
+                                          FormatException or UriFormatException or TaskCanceledException)
+            {
+                networkStatus.ForeColor = Theme.Secondary;
+                networkStatus.Text = ex.Message;
+            }
+            finally { button.Enabled = true; }
+        }
+
+        private async Task ForceFullUploadAsync(Control button)
+        {
+            button.Enabled = false;
+            networkStatus.ForeColor = Theme.Muted;
+            networkStatus.Text = "Uploading full 30-day history…";
+            try
+            {
+                Result = BuildResult();
+                if (!string.IsNullOrWhiteSpace(passphrase.Text))
+                    Result = await NetworkReporter.ConfigurePassphraseAsync(Result, passphrase.Text, CancellationToken.None);
+                if (!Result.NetworkEnabled)
+                    throw new InvalidDataException("Enable reporting before uploading.");
+                await NetworkReporter.SyncAsync(Result, true, CancellationToken.None);
+                var state = NetworkReporter.LoadState();
+                var success = state.LastStatus == "Full reconciliation complete";
+                networkStatus.ForeColor = success ? Theme.Primary : Theme.Secondary;
+                networkStatus.Text = state.LastStatus;
             }
             catch (Exception ex) when (ex is HttpRequestException or InvalidDataException or CryptographicException or
                                           FormatException or UriFormatException or TaskCanceledException)

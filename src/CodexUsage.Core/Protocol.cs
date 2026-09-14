@@ -18,6 +18,8 @@ public sealed record AggregateRow(
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ProjectId { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Effort { get; init; }
 }
 
 public sealed record SyncPayload(

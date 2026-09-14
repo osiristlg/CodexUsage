@@ -37,9 +37,10 @@ public struct AggregateRow: Codable, Equatable, Sendable {
     public var project: String
     public var tokens: Tokens
     public var projectId: String?
-    public init(bucketStartUtc: String, model: String, project: String, tokens: Tokens, projectId: String? = nil) {
+    public var effort: String?
+    public init(bucketStartUtc: String, model: String, project: String, tokens: Tokens, projectId: String? = nil, effort: String? = nil) {
         self.bucketStartUtc = bucketStartUtc; self.model = model; self.project = project
-        self.tokens = tokens; self.projectId = projectId
+        self.tokens = tokens; self.projectId = projectId; self.effort = effort
     }
 }
 public struct SyncPayload: Codable, Sendable {

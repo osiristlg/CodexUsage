@@ -1,5 +1,6 @@
 using System.Net;
 using CodexUsage.Core;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace CodexUsage.Receiver.Tests;
@@ -84,6 +85,76 @@ public sealed class ReceiverTests
     }
 
     [Fact]
+    public async Task EffortIsPersistedAsAnAggregateDimension()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "codex-usage-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "usage.db");
+        try
+        {
+            await UsageDatabase.InitializeAsync(database);
+            var start = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
+            var payload = Payload(start, new TokenCounts(100, 80, 20, 5, 1)) with
+            {
+                Rows =
+                [
+                    new AggregateRow(start, "Model", "Project", new TokenCounts(100, 80, 20, 5, 1)) { Effort = "Light" },
+                    new AggregateRow(start, "Model", "Project", new TokenCounts(25, 20, 5, 1, 1)) { Effort = "High" }
+                ]
+            };
+            var result = await UsageDatabase.ReplaceAndSummarizeAsync(database, "client-a", payload, "request-effort");
+
+            Assert.Equal(150, result.Combined.Total);
+            Assert.Equal(2, result.Rows.Count);
+            Assert.Equal(["High", "Light"], result.Rows.Select(row => row.Effort).Order());
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task LegacyDatabaseMigratesExistingRowsToUnknownEffort()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "codex-usage-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var database = Path.Combine(root, "usage.db");
+        try
+        {
+            await using (var connection = new SqliteConnection($"Data Source={database}"))
+            {
+                await connection.OpenAsync();
+                var command = connection.CreateCommand();
+                command.CommandText = """
+                    CREATE TABLE usage (
+                      client_id TEXT NOT NULL, bucket_utc TEXT NOT NULL, project TEXT NOT NULL, model TEXT NOT NULL,
+                      input_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+                      reasoning_tokens INTEGER NOT NULL, responses INTEGER NOT NULL,
+                      PRIMARY KEY (client_id, bucket_utc, project, model));
+                    INSERT INTO usage VALUES ('client-a','2026-09-10T12:00:00.0000000Z','Project','Model',100,80,20,5,1);
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            await UsageDatabase.InitializeAsync(database);
+            await using (var migrated = new SqliteConnection($"Data Source={database}"))
+            {
+                await migrated.OpenAsync();
+                var verify = migrated.CreateCommand();
+                verify.CommandText = "SELECT effort FROM usage";
+                Assert.Equal("Unknown", await verify.ExecuteScalarAsync());
+            }
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(root)) Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
     public void OptionalProjectIdIsValidatedWithoutRejectingLegacyRows()
     {
         var start = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
@@ -95,6 +166,10 @@ public sealed class ReceiverTests
             Rows = [legacy.Rows[0] with { ProjectId = "" }]
         };
         Assert.Equal("Invalid project identifier.", PayloadValidation.Validate(invalid, 10));
+        Assert.Equal("Invalid reasoning effort.", PayloadValidation.Validate(legacy with
+        {
+            Rows = [legacy.Rows[0] with { Effort = "" }]
+        }, 10));
     }
 
     [Fact]

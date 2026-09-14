@@ -172,6 +172,9 @@ struct SettingsView: View {
                         testing = false
                     }
                 }.buttonStyle(ControlDeckButtonStyle(accent: theme.secondary)).disabled(testing)
+                Button("Force full upload") { Task { await model.refresh(force: true) } }
+                    .buttonStyle(ControlDeckButtonStyle(accent: theme.secondary))
+                    .disabled(testing || model.busy || !model.settings.reportingEnabled)
                 Text(model.networkStatus).font(.system(size: 10)).foregroundStyle(theme.muted).lineLimit(2)
             }
         }

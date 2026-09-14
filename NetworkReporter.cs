@@ -141,8 +141,9 @@ internal static class NetworkReporter
         IReadOnlyList<AggregateRow> rows, string mode, ReadOnlySpan<byte> key)
     {
         if (string.Equals(mode, "none", StringComparison.OrdinalIgnoreCase))
-            return rows.GroupBy(row => new { row.BucketStartUtc, row.Model }).Select(group => new AggregateRow(
-                group.Key.BucketStartUtc, group.Key.Model, "All projects", Sum(group.Select(row => row.Tokens)))).ToArray();
+            return rows.GroupBy(row => new { row.BucketStartUtc, row.Model, row.Effort }).Select(group => new AggregateRow(
+                group.Key.BucketStartUtc, group.Key.Model, "All projects", Sum(group.Select(row => row.Tokens)))
+                { Effort = group.Key.Effort }).ToArray();
 
         using var hmac = new HMACSHA256(key.ToArray());
         return rows.Select(row =>

@@ -6,6 +6,7 @@ Each client scans its own Codex session logs and sends only derived hourly rows 
 
 - UTC hour
 - model label
+- reasoning-effort label when the client log provides one; legacy rows are retained as `Unknown`
 - input, cached-input, output, reasoning, and response counts
 - an optional stable anonymous `projectId`; anonymous mode also uses it as `project`, names mode keeps the real name in `project`, and no-project mode omits it
 - the user-configured machine name
@@ -44,7 +45,7 @@ Repeat registration for each dashboard. Each client receives its own random salt
 
 - Normal refreshes replace the current and previous UTC-hour buckets, making late log updates converge.
 - The first successful refresh after 2 a.m. local time replaces the last 30 local days. Failed attempts retry on subsequent refreshes.
-- **Rebuild 30 days** forces a full replacement.
+- **Rebuild 30 days** or **Force full upload** forces a full replacement.
 - Request IDs make retries idempotent. The receiver replaces the entire declared range within one database transaction.
 - The receiver returns today's combined total and per-machine totals in the encrypted response. The dashboard shows the combined total below its local total.
 
