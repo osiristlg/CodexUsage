@@ -56,7 +56,7 @@ internal static class Program
 }
 
 internal sealed record UsagePoint(DateTime Time, string Model, string Project, long Input, long Cached, long Output, long Reasoning,
-    long Responses = 1)
+    long Responses = 1, string Effort = "Unknown")
 {
     public long Total => Input + Output;
 }
@@ -73,8 +73,8 @@ internal sealed record UsageSnapshot(DateTime Day, DateTime RefreshedAt, IReadOn
 
 internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects);
 internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
-    IReadOnlyList<HourlyUsage>? Hours = null);
-internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 4);
+    IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null);
+internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 5);
 
 internal static class LogScanner
 {
@@ -111,7 +111,8 @@ internal static class LogScanner
                         hourPoints.GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
                 }).ToArray();
                 return new DailyUsage(date, dayPoints.Sum(p => p.Total), dayPoints
-                    .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours);
+                    .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours,
+                    dayPoints.GroupBy(p => p.Effort).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
             }).ToArray();
         return new HistoryCache(DateTime.Now, result);
     }, token);
@@ -180,8 +181,10 @@ internal static class LogScanner
     private static void ScanFile(string file, DateTime firstDay, DateTime lastDay, List<UsagePoint> points, CancellationToken token)
     {
         var modelByTurn = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var effortByTurn = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         string fallbackModel = "Unknown model";
         string currentModel = fallbackModel;
+        string currentEffort = "Unknown";
         string currentProject = "Projectless";
         var countPoints = new List<UsagePoint>();
         var recordPoints = new List<UsagePoint>();
@@ -217,11 +220,15 @@ internal static class LogScanner
                     }
                     if (type == "turn_context")
                     {
-                        if (payload.TryGetProperty("turn_id", out var tid) && payload.TryGetProperty("model", out var model))
+                        var contextTurnId = payload.TryGetProperty("turn_id", out var tid) ? tid.GetString() ?? "" : "";
+                        if (payload.TryGetProperty("model", out var model))
                         {
                             currentModel = FriendlyModel(model.GetString());
-                            modelByTurn[tid.GetString() ?? ""] = currentModel;
+                            if (contextTurnId.Length > 0) modelByTurn[contextTurnId] = currentModel;
                         }
+                        currentEffort = payload.TryGetProperty("reasoning_effort", out var effort)
+                            ? FriendlyEffort(effort.GetString()) : "Unknown";
+                        if (contextTurnId.Length > 0) effortByTurn[contextTurnId] = currentEffort;
                         continue;
                     }
 
@@ -236,15 +243,16 @@ internal static class LogScanner
                         info.TryGetProperty("last_token_usage", out var lastUsage) &&
                         lastUsage.ValueKind == JsonValueKind.Object)
                     {
-                        countPoints.Add(ToPoint(local, currentModel, currentProject, lastUsage));
+                        countPoints.Add(ToPoint(local, currentModel, currentProject, currentEffort, lastUsage));
                         continue;
                     }
                     if (type != "token_usage_record") continue;
 
                     var turnId = payload.TryGetProperty("turn_id", out var tr) ? tr.GetString() ?? "" : "";
                     var modelName = modelByTurn.GetValueOrDefault(turnId, fallbackModel);
+                    var effortName = effortByTurn.GetValueOrDefault(turnId, "Unknown");
                     var usage = payload.GetProperty("usage");
-                    recordPoints.Add(ToPoint(local, modelName, currentProject, usage));
+                    recordPoints.Add(ToPoint(local, modelName, currentProject, effortName, usage));
                 }
                 catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or KeyNotFoundException)
                 { /* Skip incomplete or legacy-shaped records without interrupting a refresh. */ }
@@ -254,14 +262,15 @@ internal static class LogScanner
         points.AddRange(countPoints.Count > 0 ? countPoints : recordPoints);
     }
 
-    private static UsagePoint ToPoint(DateTime time, string model, string project, JsonElement usage) => new(
+    private static UsagePoint ToPoint(DateTime time, string model, string project, string effort, JsonElement usage) => new(
         time,
         model,
         project,
         GetLong(usage, "input_tokens"),
         GetLong(usage, "cached_input_tokens"),
         GetLong(usage, "output_tokens"),
-        GetLong(usage, "reasoning_output_tokens"));
+        GetLong(usage, "reasoning_output_tokens"),
+        Effort: effort);
 
     private static long GetLong(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.TryGetInt64(out var result) ? result : 0;
@@ -270,6 +279,15 @@ internal static class LogScanner
         ? "Unknown model"
         : model.Replace("gpt-", "GPT ", StringComparison.OrdinalIgnoreCase)
                .Replace("codex", "Codex", StringComparison.OrdinalIgnoreCase);
+
+    private static string FriendlyEffort(string? effort) => effort?.Trim().ToLowerInvariant() switch
+    {
+        "low" or "light" or "minimal" => "Light",
+        "medium" => "Medium",
+        "high" => "High",
+        null or "" => "Unknown",
+        var value => CultureInfo.InvariantCulture.TextInfo.ToTitleCase(value.Replace('_', ' '))
+    };
 
     private static string FriendlyProject(string? cwd)
     {
@@ -318,7 +336,9 @@ internal static class HistoryStore
                 hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
         }).ToArray();
         var snapshotDay = snapshot.Day.Date;
-        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours);
+        var efforts = snapshot.Points.GroupBy(point => point.Effort)
+            .ToDictionary(group => group.Key, group => group.Sum(point => point.Total));
+        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours, efforts);
         var days = cache.Days.Select(day => day.Date.Date == snapshotDay ? today : day).ToList();
         if (!days.Any(day => day.Date.Date == snapshotDay))
         {
@@ -329,7 +349,7 @@ internal static class HistoryStore
     }
 
     public static bool ShouldAutoBuild(HistoryCache? cache) =>
-        cache is null || cache.FormatVersion < 4 ||
+        cache is null || cache.FormatVersion < 5 ||
         (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
 
     public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
@@ -349,7 +369,8 @@ internal static class HistoryStore
                     hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
             }).ToArray();
             return new DailyUsage(date, dayPoints.Sum(point => point.Total),
-                dayPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)), hours);
+                dayPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)), hours,
+                dayPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
         }).ToArray();
         var todayPoints = byDay.GetValueOrDefault(DateTime.Today) ?? [];
         return (new UsageSnapshot(DateTime.Today, DateTime.Now, todayPoints, 0), new HistoryCache(DateTime.Now, days));
@@ -2296,12 +2317,21 @@ internal sealed class DashboardForm : Form
                             .GroupBy(model => model.Key)
                             .Select(group => (Name: group.Key, Tokens: group.Sum(model => model.Value)))
                             .OrderByDescending(model => model.Tokens).ToArray();
+                        var effortTotals = (days[index].Efforts ?? new Dictionary<string, long> { ["Unknown"] = days[index].Tokens })
+                            .Where(effort => effort.Value > 0)
+                            .OrderBy(effort => effort.Key switch { "Light" => 0, "Medium" => 1, "High" => 2, "Unknown" => 4, _ => 3 })
+                            .ToArray();
+                        var maxModelRows = Math.Max(2, Math.Min(6, (r.Height - 86 - effortTotals.Length * 18) / 20));
+                        var visibleModelCount = modelTotals.Length > maxModelRows ? maxModelRows - 1 : maxModelRows;
+                        var visibleModels = modelTotals.Take(visibleModelCount).ToArray();
+                        var hiddenModelCount = modelTotals.Length - visibleModels.Length;
                         const int tooltipWidth = 250;
-                        var tooltipHeight = 50 + modelTotals.Length * 20;
+                        var modelRows = visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0);
+                        var tooltipHeight = 76 + modelRows * 20 + effortTotals.Length * 18;
                         var tooltipX = Math.Clamp((int)point.X - tooltipWidth / 2, plot.Left, plot.Right - tooltipWidth);
                         var tooltipY = (int)point.Y - tooltipHeight - 12;
-                        if (tooltipY < plot.Top + 4) tooltipY = (int)point.Y + 14;
-                        tooltipY = Math.Min(tooltipY, plot.Bottom - tooltipHeight - 4);
+                        if (tooltipY < r.Top + 5) tooltipY = (int)point.Y + 14;
+                        tooltipY = Math.Clamp(tooltipY, r.Top + 5, r.Bottom - tooltipHeight - 5);
                         var tooltip = new Rectangle(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
                         FillRound(g, tooltip, 8, Darken(Panel, 4));
                         StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
@@ -2312,9 +2342,9 @@ internal sealed class DashboardForm : Form
                         g.DrawString($"{days[index].Tokens:N0} tokens", tipValue,
                             new SolidBrush(TextMain), tooltip.X + 10, tooltip.Y + 23);
                         using var modelFont = new Font("Segoe UI", 8.5f);
-                        for (var modelIndex = 0; modelIndex < modelTotals.Length; modelIndex++)
+                        for (var modelIndex = 0; modelIndex < visibleModels.Length; modelIndex++)
                         {
-                            var model = modelTotals[modelIndex];
+                            var model = visibleModels[modelIndex];
                             var rowY = tooltip.Y + 48 + modelIndex * 20;
                             var color = Palette[modelIndex % Palette.Length];
                             using var modelDot = new SolidBrush(color);
@@ -2326,6 +2356,33 @@ internal sealed class DashboardForm : Form
                             TextRenderer.DrawText(g, model.Name, modelFont, nameRect, TextMuted,
                                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
                                 TextFormatFlags.NoPadding);
+                            g.DrawString(valueText, modelFont, new SolidBrush(TextMain),
+                                tooltip.Right - valueSize.Width - 11, rowY);
+                        }
+                        if (hiddenModelCount > 0)
+                            g.DrawString($"+ {hiddenModelCount} more model{(hiddenModelCount == 1 ? "" : "s")}", modelFont,
+                                new SolidBrush(TextMuted), tooltip.X + 25, tooltip.Y + 48 + visibleModels.Length * 20);
+
+                        var effortTop = tooltip.Y + 52 + modelRows * 20;
+                        using var divider = new Pen(Color.FromArgb(45, TextMuted), 1f);
+                        g.DrawLine(divider, tooltip.X + 10, effortTop - 5, tooltip.Right - 10, effortTop - 5);
+                        g.DrawString("REASONING EFFORT", tipDate, new SolidBrush(TextMuted), tooltip.X + 10, effortTop);
+                        for (var effortIndex = 0; effortIndex < effortTotals.Length; effortIndex++)
+                        {
+                            var effort = effortTotals[effortIndex];
+                            var rowY = effortTop + 18 + effortIndex * 18;
+                            var color = effort.Key switch
+                            {
+                                "Light" => Theme.Primary,
+                                "Medium" => Theme.Secondary,
+                                "High" => Theme.Tertiary,
+                                _ => TextMuted
+                            };
+                            using var effortDot = new SolidBrush(color);
+                            g.FillEllipse(effortDot, tooltip.X + 11, rowY + 4, 7, 7);
+                            g.DrawString(effort.Key, modelFont, new SolidBrush(TextMuted), tooltip.X + 25, rowY);
+                            var valueText = Compact(effort.Value);
+                            var valueSize = g.MeasureString(valueText, modelFont);
                             g.DrawString(valueText, modelFont, new SolidBrush(TextMain),
                                 tooltip.Right - valueSize.Width - 11, rowY);
                         }
