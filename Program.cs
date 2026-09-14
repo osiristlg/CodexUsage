@@ -74,7 +74,7 @@ internal sealed record UsageSnapshot(DateTime Day, DateTime RefreshedAt, IReadOn
 internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects);
 internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
     IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null);
-internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 5);
+internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 6);
 
 internal static class LogScanner
 {
@@ -226,8 +226,7 @@ internal static class LogScanner
                             currentModel = FriendlyModel(model.GetString());
                             if (contextTurnId.Length > 0) modelByTurn[contextTurnId] = currentModel;
                         }
-                        currentEffort = payload.TryGetProperty("reasoning_effort", out var effort)
-                            ? FriendlyEffort(effort.GetString()) : "Unknown";
+                        currentEffort = FriendlyEffort(ReadEffort(payload));
                         if (contextTurnId.Length > 0) effortByTurn[contextTurnId] = currentEffort;
                         continue;
                     }
@@ -289,6 +288,18 @@ internal static class LogScanner
         var value => CultureInfo.InvariantCulture.TextInfo.ToTitleCase(value.Replace('_', ' '))
     };
 
+    private static string? ReadEffort(JsonElement payload)
+    {
+        if (payload.TryGetProperty("reasoning_effort", out var reasoningEffort)) return reasoningEffort.GetString();
+        if (payload.TryGetProperty("effort", out var effort)) return effort.GetString();
+        if (payload.TryGetProperty("collaboration_mode", out var collaborationMode) &&
+            collaborationMode.ValueKind == JsonValueKind.Object &&
+            collaborationMode.TryGetProperty("settings", out var settings) &&
+            settings.ValueKind == JsonValueKind.Object &&
+            settings.TryGetProperty("reasoning_effort", out var nestedEffort)) return nestedEffort.GetString();
+        return null;
+    }
+
     private static string FriendlyProject(string? cwd)
     {
         if (string.IsNullOrWhiteSpace(cwd)) return "Projectless";
@@ -349,7 +360,7 @@ internal static class HistoryStore
     }
 
     public static bool ShouldAutoBuild(HistoryCache? cache) =>
-        cache is null || cache.FormatVersion < 5 ||
+        cache is null || cache.FormatVersion < 6 ||
         (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
 
     public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
