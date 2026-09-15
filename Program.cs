@@ -55,10 +55,11 @@ internal static class Program
     private static extern bool AttachConsole(uint processId);
 }
 
-internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects);
+internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects,
+    Dictionary<string, long>? Efforts = null);
 internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
     IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null);
-internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 6);
+internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 7);
 
 internal static class LogScanner
 {
@@ -92,7 +93,8 @@ internal static class LogScanner
                     var hourPoints = dayPoints.Where(p => p.Time.Hour == hour).ToArray();
                     return new HourlyUsage(hour, hourPoints.Sum(p => p.Total),
                         hourPoints.GroupBy(p => p.Model).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
-                        hourPoints.GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
+                        hourPoints.GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
+                        hourPoints.GroupBy(p => p.Effort).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
                 }).ToArray();
                 return new DailyUsage(date, dayPoints.Sum(p => p.Total), dayPoints
                     .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours,
@@ -329,7 +331,8 @@ internal static class HistoryStore
             var hourPoints = snapshot.Points.Where(point => point.Time.Hour == hour).ToArray();
             return new HourlyUsage(hour, hourPoints.Sum(point => point.Total),
                 hourPoints.GroupBy(point => point.Model).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
-                hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
+                hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
+                hourPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
         }).ToArray();
         var snapshotDay = snapshot.Day.Date;
         var efforts = snapshot.Points.GroupBy(point => point.Effort)
@@ -345,7 +348,7 @@ internal static class HistoryStore
     }
 
     public static bool ShouldAutoBuild(HistoryCache? cache) =>
-        cache is null || cache.FormatVersion < 6 ||
+        cache is null || cache.FormatVersion < 7 ||
         (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
 
     public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
@@ -363,7 +366,8 @@ internal static class HistoryStore
                 var hourPoints = dayPoints.Where(point => point.Time.Hour == hour).ToArray();
                 return new HourlyUsage(hour, hourPoints.Sum(point => point.Total),
                     hourPoints.GroupBy(point => point.Model).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
-                    hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
+                    hourPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
+                    hourPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
             }).ToArray();
             return new DailyUsage(date, dayPoints.Sum(point => point.Total),
                 dayPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)), hours,
@@ -2137,11 +2141,22 @@ internal sealed class DashboardForm : Form
                     })
                     .Where(model => model.Tokens > 0)
                     .ToArray();
-                var maxVisibleModels = Math.Max(1, (plot.Height - 70) / 18);
-                var visibleModels = activeModels.Take(maxVisibleModels).ToArray();
+                var effortSource = chartDate == DateTime.Today ? s.Aggregates.HourlyEfforts[selectedHour]
+                    : history?.Days.FirstOrDefault(day => day.Date.Date == chartDate)?.Hours?
+                        .FirstOrDefault(hour => hour.Hour == selectedHour)?.Efforts;
+                var efforts = (effortSource ?? new Dictionary<string, long> { ["Unknown"] = totals[selectedHour] })
+                    .Where(pair => pair.Value > 0).OrderByDescending(pair => pair.Value).ThenBy(pair => pair.Key).ToArray();
+                var rowSlots = Math.Max(2, (plot.Height - 84) / 18);
+                var effortSlots = Math.Min(efforts.Length, Math.Max(1, rowSlots / 2));
+                var visibleEfforts = efforts.Take(efforts.Length > effortSlots ? Math.Max(0, effortSlots - 1) : effortSlots).ToArray();
+                var hiddenEffortCount = efforts.Length - visibleEfforts.Length;
+                var modelSlots = rowSlots - effortSlots;
+                var visibleModels = activeModels.Take(activeModels.Length > modelSlots ? Math.Max(0, modelSlots - 1) : modelSlots).ToArray();
                 var hiddenModelCount = activeModels.Length - visibleModels.Length;
                 const int tooltipWidth = 230;
-                var tooltipHeight = 54 + (visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0)) * 18;
+                var modelRows = visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0);
+                var tooltipHeight = 54 + modelRows * 18 + (efforts.Length > 0
+                    ? 24 + (visibleEfforts.Length + (hiddenEffortCount > 0 ? 1 : 0)) * 18 : 0);
                 var tooltip = new Rectangle(
                     Math.Clamp((int)(x + barSlot / 2) - tooltipWidth / 2, plot.Left, plot.Right - tooltipWidth),
                     Math.Clamp((int)barTop - tooltipHeight - 14, plot.Top - 8, plot.Bottom - tooltipHeight - 5),
@@ -2169,6 +2184,31 @@ internal sealed class DashboardForm : Form
                 if (hiddenModelCount > 0)
                     g.DrawString($"+ {hiddenModelCount} more model{(hiddenModelCount == 1 ? "" : "s")}", tipLabel,
                         new SolidBrush(TextMuted), tooltip.X + 24, tooltip.Y + 47 + visibleModels.Length * 18);
+                if (efforts.Length > 0)
+                {
+                    var effortY = tooltip.Y + 47 + modelRows * 18;
+                    using var divider = new Pen(Color.FromArgb(70, Theme.Tertiary));
+                    g.DrawLine(divider, tooltip.X + 10, effortY + 1, tooltip.Right - 10, effortY + 1);
+                    using var headingBrush = new SolidBrush(Theme.Tertiary);
+                    g.DrawString("REASONING EFFORT", tipLabel, headingBrush, tooltip.X + 10, effortY + 5);
+                    for (var i = 0; i < visibleEfforts.Length; i++)
+                    {
+                        var rowY = effortY + 24 + i * 18;
+                        var value = visibleEfforts[i].Value.ToString("N0");
+                        var valueSize = g.MeasureString(value, tipLabel);
+                        TextRenderer.DrawText(g, visibleEfforts[i].Key, tipLabel,
+                            new Rectangle(tooltip.X + 10, rowY, tooltip.Width - 27 - (int)valueSize.Width, 16),
+                            TextMuted, TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+                        using var valueBrush = new SolidBrush(TextMain);
+                        g.DrawString(value, tipLabel, valueBrush, tooltip.Right - valueSize.Width - 10, rowY);
+                    }
+                    if (hiddenEffortCount > 0)
+                    {
+                        using var mutedBrush = new SolidBrush(TextMuted);
+                        g.DrawString($"+ {hiddenEffortCount} more effort levels", tipLabel, mutedBrush,
+                            tooltip.X + 10, effortY + 24 + visibleEfforts.Length * 18);
+                    }
+                }
             }
             foreach (var h in new[] { 0, 4, 8, 12, 16, 20, 23 })
             {

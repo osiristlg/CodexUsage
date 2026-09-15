@@ -14,7 +14,7 @@ The Windows client uses .NET and Windows Forms. A native SwiftUI client for macO
 - Hourly usage grouped by model
 - Usage grouped by project
 - An interactive rolling 30-day history
-- Reasoning-effort breakdowns in the 30-day chart tooltips (separate from reasoning-token counts; hourly charts stay model-only)
+- Reasoning-effort breakdowns in hourly and 30-day chart tooltips (separate from reasoning-token counts)
 - Historical hourly and project breakdowns
 - Automatic refresh, with a configurable interval
 - Optional encrypted, aggregate-only reporting across machines on the same LAN
@@ -23,6 +23,11 @@ The Windows client uses .NET and Windows Forms. A native SwiftUI client for macO
 - Several built-in visual themes
 
 Hover over the charts for more detail. Select a day in the 30-day chart to inspect it, and use **Rebuild 30 days** when you want to rescan the local history immediately.
+
+## New in 1.2.2
+
+- Hourly bar tooltips now show reasoning-effort token totals on Windows and macOS, alongside the hour's total and model information.
+- Effort totals use cached aggregates, preserving the responsiveness improvements from 1.2.1. Unknown effort remains explicit when logs or older uploads do not provide it.
 
 ## New in 1.2.1
 
@@ -132,6 +137,6 @@ The native macOS client includes local token totals, selectable 30-day history, 
 
 ## Current status
 
-Version 1.2.1 includes native Windows and macOS dashboards, performance improvements, interactive history with reasoning-effort detail, themes, snapshot export, and optional encrypted aggregate reporting across your local network.
+Version 1.2.2 includes native Windows and macOS dashboards, performance improvements, hourly and historical reasoning-effort detail, themes, snapshot export, and optional encrypted aggregate reporting across your local network.
 
 Small utilities, made because we can.

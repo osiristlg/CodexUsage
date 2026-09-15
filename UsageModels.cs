@@ -44,6 +44,8 @@ internal sealed class SnapshotAggregates
     public Dictionary<string, long> Projects { get; } = new();
     public Dictionary<string, long>[] HourlyProjects { get; } = Enumerable.Range(0, 24)
         .Select(_ => new Dictionary<string, long>()).ToArray();
+    public Dictionary<string, long>[] HourlyEfforts { get; } = Enumerable.Range(0, 24)
+        .Select(_ => new Dictionary<string, long>()).ToArray();
 
     public static SnapshotAggregates Build(IReadOnlyList<UsagePoint> points)
     {
@@ -62,6 +64,9 @@ internal sealed class SnapshotAggregates
             result.Projects[point.Project] = result.Projects.GetValueOrDefault(point.Project) + point.Total;
             var projects = result.HourlyProjects[hour];
             projects[point.Project] = projects.GetValueOrDefault(point.Project) + point.Total;
+            var effort = string.IsNullOrWhiteSpace(point.Effort) ? "Unknown" : point.Effort.Trim();
+            var efforts = result.HourlyEfforts[hour];
+            efforts[effort] = efforts.GetValueOrDefault(effort) + point.Total;
         }
         return result;
     }

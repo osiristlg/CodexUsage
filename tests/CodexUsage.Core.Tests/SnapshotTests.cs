@@ -8,6 +8,26 @@ namespace CodexUsage.Core.Tests;
 public sealed class SnapshotTests(ITestOutputHelper output)
 {
     [Fact]
+    public void EffortTotalsAreCachedPerHourWithUnknownFallback()
+    {
+        var day = new DateTime(2026, 9, 15);
+        var snapshot = new UsageSnapshot(day, day,
+        [
+            new UsagePoint(day.AddHours(1), "A", "One", 100, 0, 20, 0, Effort: "High"),
+            new UsagePoint(day.AddHours(1), "B", "One", 50, 0, 10, 0, Effort: "Light"),
+            new UsagePoint(day.AddHours(2), "A", "Two", 25, 0, 5, 0, Effort: "High"),
+            new UsagePoint(day.AddHours(2), "B", "Two", 10, 0, 0, 0, Effort: " ")
+        ], 1);
+        Assert.Equal(120, snapshot.Aggregates.HourlyEfforts[1]["High"]);
+        Assert.Equal(60, snapshot.Aggregates.HourlyEfforts[1]["Light"]);
+        Assert.Equal(30, snapshot.Aggregates.HourlyEfforts[2]["High"]);
+        Assert.Equal(10, snapshot.Aggregates.HourlyEfforts[2]["Unknown"]);
+        Assert.Empty(snapshot.Aggregates.HourlyEfforts[0]);
+        Assert.Equal(snapshot.Total, snapshot.Aggregates.HourlyEfforts.Sum(hour => hour.Values.Sum()));
+        Assert.Same(snapshot.Aggregates, snapshot.Aggregates);
+    }
+
+    [Fact]
     public void LargeSnapshotMatchesPreviousHourlyCalculationAndReusesCache()
     {
         var day = new DateTime(2026, 9, 15);
