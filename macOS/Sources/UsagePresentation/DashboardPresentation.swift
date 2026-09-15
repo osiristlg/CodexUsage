@@ -6,6 +6,7 @@ public struct DailyValue: Identifiable, Equatable, Sendable {
     public let day: Date
     public let total: Int64
     public let models: [String: Int64]
+    public let efforts: [String: Int64]
 }
 
 public struct HourValue: Identifiable, Equatable, Sendable {
@@ -28,7 +29,11 @@ public enum DashboardPresentation {
             let day = calendar.date(byAdding: .day, value: offset, to: calendar.startOfDay(for: now))!
             let values = grouped[day] ?? []
             let models = Dictionary(grouping: values, by: \.model).mapValues { $0.reduce(0) { $0 + $1.tokens.total } }
-            return DailyValue(day: day, total: values.reduce(0) { $0 + $1.tokens.total }, models: models)
+            let efforts = Dictionary(grouping: values) { point in
+                let label = point.effort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return label.isEmpty ? "Unknown" : label
+            }.mapValues { $0.reduce(Int64(0)) { $0 + $1.tokens.total } }
+            return DailyValue(day: day, total: values.reduce(0) { $0 + $1.tokens.total }, models: models, efforts: efforts)
         }
     }
 

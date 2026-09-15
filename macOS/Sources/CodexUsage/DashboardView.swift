@@ -309,6 +309,14 @@ private struct HistoryPanel: View {
                                     HStack(spacing: 6) { Circle().fill(theme.series[max(0, day.models.keys.sorted().firstIndex(of: name) ?? 0) % theme.series.count]).frame(width: 6, height: 6); Text(name).lineLimit(1); Spacer(); Text(count(value)).foregroundStyle(theme.text) }
                                         .font(.system(size: 10)).foregroundStyle(theme.muted)
                                 }
+                                if !day.efforts.isEmpty {
+                                    Divider().overlay(theme.muted.opacity(0.3))
+                                    Text("REASONING EFFORT").font(.system(size: 9, weight: .semibold)).foregroundStyle(theme.tertiary)
+                                    ForEach(day.efforts.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }), id: \.key) { effort, value in
+                                        HStack { Text(effort); Spacer(); Text(count(value)).foregroundStyle(theme.text) }
+                                            .font(.system(size: 10)).foregroundStyle(theme.muted)
+                                    }
+                                }
                             }.frame(width: 220)
                         }
                 }

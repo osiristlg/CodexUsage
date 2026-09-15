@@ -15,6 +15,8 @@ try await networkChecks()
 print("PASS: scanner precedence, privacy, hour boundaries, local 2am scheduling, DST and retry identity")
 try ReceiverConfigurationTests().run()
 print("PASS: receiver settings schema, validation, registration and credential rotation")
+try PresentationTests().run()
+print("PASS: daily mixed and Unknown effort totals, day isolation and unchanged hourly grouping")
 
 if CommandLine.arguments.contains("--scan-local") {
     let now = Date()
