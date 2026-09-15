@@ -74,3 +74,41 @@ public enum DashboardPresentation {
         return value
     }
 }
+
+/// Immutable derived data. Build once when history changes; interaction only looks up buckets.
+public struct DashboardAggregates: Sendable {
+    public let days: [DailyValue]
+    private let calendar: Calendar
+    private let countsByDay: [Date: Int]
+    private let tokensByDay: [Date: Tokens]
+    private let hoursByDay: [Date: [HourValue]]
+    private let projectsByDay: [Date: [ProjectValue]]
+    private let projectsByHour: [Date: [Int: [ProjectValue]]]
+
+    public init(_ points: [UsagePoint], now: Date = Date(), calendar: Calendar = .current) {
+        self.calendar = calendar
+        days = DashboardPresentation.days(points, now: now, calendar: calendar)
+        let grouped = Dictionary(grouping: points) { calendar.startOfDay(for: $0.time) }
+        countsByDay = grouped.mapValues { $0.count }
+        tokensByDay = grouped.mapValues { $0.reduce(Tokens()) { $0 + $1.tokens } }
+        hoursByDay = grouped.mapValues { values in
+            DashboardPresentation.hours(values, day: values[0].time, calendar: calendar)
+        }
+        projectsByDay = grouped.mapValues { values in
+            DashboardPresentation.projects(values, pinnedDay: values[0].time, hoveredDay: nil, hoveredHour: nil, calendar: calendar)
+        }
+        projectsByHour = grouped.mapValues { values in
+            Dictionary(grouping: values) { calendar.component(.hour, from: $0.time) }.mapValues { bucket in
+                DashboardPresentation.projects(bucket, pinnedDay: bucket[0].time, hoveredDay: nil, hoveredHour: nil, calendar: calendar)
+            }
+        }
+    }
+    public func responseCount(day: Date) -> Int { countsByDay[calendar.startOfDay(for: day)] ?? 0 }
+    public func tokens(day: Date) -> Tokens { tokensByDay[calendar.startOfDay(for: day)] ?? Tokens() }
+    public func hours(day: Date) -> [HourValue] { hoursByDay[calendar.startOfDay(for: day)] ?? [] }
+    public func projects(day: Date, hour: Int?) -> [ProjectValue] {
+        let key = calendar.startOfDay(for: day)
+        if let hour { return projectsByHour[key]?[hour] ?? [] }
+        return projectsByDay[key] ?? []
+    }
+}

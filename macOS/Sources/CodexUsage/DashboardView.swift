@@ -117,7 +117,7 @@ private struct HeroPanel: View {
                             .font(.system(size: 11, weight: .semibold)).tracking(0.7).foregroundStyle(theme.tertiary)
                             .help(model.network.machines.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value.total.formatted())" }.joined(separator: "\n"))
                     }
-                    Text("\(model.points.filter { Calendar.current.isDateInToday($0.time) }.count.formatted()) responses across \(model.filesScanned.formatted()) log files")
+                    Text("\(model.aggregates.responseCount(day: Date()).formatted()) responses across \(model.filesScanned.formatted()) log files")
                         .font(.system(size: 11, weight: .medium)).foregroundStyle(theme.muted).lineLimit(1)
                 }
                 .frame(width: max(270, geometry.size.width * 0.27), alignment: .leading)
@@ -153,12 +153,16 @@ private struct HourlyPanel: View {
     @ObservedObject var model: DashboardModel
     @Environment(\.dashboardTheme) private var theme
     private var day: Date { model.selectedDate ?? Date() }
-    private var values: [HourValue] { DashboardPresentation.hours(model.points, day: day) }
+    private var values: [HourValue] { model.aggregates.hours(day: day) }
     private var models: [String] {
         Dictionary(grouping: values, by: \.model).map { ($0.key, $0.value.reduce(0) { $0 + $1.total }) }
             .sorted { $0.1 > $1.1 }.map(\.0)
     }
-    private var totals: [Int64] { (0..<24).map { hour in values.filter { $0.hour == hour }.reduce(0) { $0 + $1.total } } }
+    private var totals: [Int64] {
+        var result = Array(repeating: Int64(0), count: 24)
+        for value in values { result[value.hour] += value.total }
+        return result
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -213,11 +217,11 @@ private struct HourlyChart: View {
                 Color.clear.contentShape(Rectangle()).onContinuousHover { phase in
                     switch phase {
                     case .active(let location):
-                        guard let anchor = proxy.plotFrame else { model.hoveredHour = nil; return }
+                        guard let anchor = proxy.plotFrame else { model.setHover(day: nil, hour: nil); return }
                         let plot = geometry[anchor]
-                        guard plot.contains(location), let x: Double = proxy.value(atX: location.x - plot.minX) else { model.hoveredHour = nil; return }
-                        model.hoveredHour = min(23, max(0, Int(floor(x + 0.5)))); model.hoveredDate = nil
-                    case .ended: model.hoveredHour = nil
+                        guard plot.contains(location), let x: Double = proxy.value(atX: location.x - plot.minX) else { model.setHover(day: nil, hour: nil); return }
+                        model.setHover(day: nil, hour: min(23, max(0, Int(floor(x + 0.5)))))
+                    case .ended: model.setHover(day: nil, hour: nil)
                     }
                 }
             }
@@ -234,7 +238,7 @@ private struct ProjectPanel: View {
     @ObservedObject var model: DashboardModel
     @Environment(\.dashboardTheme) private var theme
     private var values: [ProjectValue] {
-        DashboardPresentation.projects(model.points, pinnedDay: model.selectedDate, hoveredDay: model.hoveredDate, hoveredHour: model.hoveredHour)
+        model.aggregates.projects(day: effectiveDay, hour: model.hoveredHour)
     }
     private var effectiveDay: Date { model.hoveredDate ?? model.selectedDate ?? Date() }
     private var scope: String {
@@ -273,7 +277,7 @@ private struct ProjectPanel: View {
 private struct HistoryPanel: View {
     @ObservedObject var model: DashboardModel
     @Environment(\.dashboardTheme) private var theme
-    private var days: [DailyValue] { DashboardPresentation.days(model.points) }
+    private var days: [DailyValue] { model.aggregates.days }
     private var hovered: DailyValue? { model.hoveredDate.flatMap { date in days.first { Calendar.current.isDate($0.day, inSameDayAs: date) } } }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -330,18 +334,16 @@ private struct HistoryPanel: View {
                             switch phase {
                             case .active(let location):
                                 guard let plot = proxy.plotFrame.map({ geometry[$0] }), plot.contains(location),
-                                      let value: Date = proxy.value(atX: location.x - plot.minX) else { model.hoveredDate = nil; return }
-                                model.hoveredDate = days.min(by: { abs($0.day.timeIntervalSince(value)) < abs($1.day.timeIntervalSince(value)) })?.day
-                                model.hoveredHour = nil
-                            case .ended: model.hoveredDate = nil
+                                      let value: Date = proxy.value(atX: location.x - plot.minX) else { model.setHover(day: nil, hour: nil); return }
+                                model.setHover(day: days.min(by: { abs($0.day.timeIntervalSince(value)) < abs($1.day.timeIntervalSince(value)) })?.day, hour: nil)
+                            case .ended: model.setHover(day: nil, hour: nil)
                             }
                         }
                         .gesture(SpatialTapGesture().onEnded { event in
                             guard let plot = proxy.plotFrame.map({ geometry[$0] }), plot.contains(event.location),
                                   let value: Date = proxy.value(atX: event.location.x - plot.minX),
                                   let day = days.min(by: { abs($0.day.timeIntervalSince(value)) < abs($1.day.timeIntervalSince(value)) }) else { return }
-                            model.hoveredDate = day.day
-                            model.hoveredHour = nil
+                            model.setHover(day: day.day, hour: nil)
                             model.selectedDate = DashboardPresentation.toggledPin(current: model.selectedDate, clicked: day.day)
                         })
                 }

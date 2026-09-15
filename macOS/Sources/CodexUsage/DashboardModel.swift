@@ -1,11 +1,13 @@
 import SwiftUI
 import AppKit
 import UsageCore
+import UsagePresentation
 
 @MainActor final class DashboardModel: ObservableObject {
     let receiverHost = ReceiverHostModel()
     @Published var settings = LocalStore.load("mac-settings.json", as: UsageCore.Settings.self) ?? UsageCore.Settings()
     @Published var points: [UsagePoint] = []
+    private(set) var aggregates = DashboardAggregates([])
     @Published var network = NetworkState()
     @Published var busy = false
     @Published var status = "Ready"
@@ -24,7 +26,7 @@ import UsageCore
         points.filter { Calendar.current.isDate($0.time, inSameDayAs: selectedDay) }
     }
     var todayTokens: Tokens {
-        points.filter { Calendar.current.isDateInToday($0.time) }.reduce(Tokens()) { $0 + $1.tokens }
+        aggregates.tokens(day: Date())
     }
     var visibleCombined: Tokens? {
         guard settings.reportingEnabled, let day = network.combinedDay, Calendar.current.isDateInToday(day) else { return nil }
@@ -40,8 +42,13 @@ import UsageCore
             catch { status = "Could not save initial settings: \(error.localizedDescription)" }
         }
         points = LocalStore.load("mac-history.json", as: [UsagePoint].self) ?? []
+        aggregates = DashboardAggregates(points)
         network = LocalStore.load("mac-network-state.json", as: NetworkState.self) ?? NetworkState()
         networkStatus = settings.reportingEnabled ? "Waiting for refresh" : "Reporting disabled"
+    }
+    func setHover(day: Date?, hour: Int?) {
+        if hoveredDate != day { hoveredDate = day }
+        if hoveredHour != hour { hoveredHour = hour }
     }
     func run() async {
         await refresh()
@@ -66,12 +73,14 @@ import UsageCore
         let start = cal.date(byAdding: .day, value: -29, to: cal.startOfDay(for: now))!
         let end = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now))!
         do {
-            let scan = try await Task.detached(priority: .utility) {
-                try LogScanner.scan(folder: URL(fileURLWithPath: config.sessionsFolder), start: start, end: end)
+            let (scan, derived) = try await Task.detached(priority: .utility) {
+                let scan = try LogScanner.scan(folder: URL(fileURLWithPath: config.sessionsFolder), start: start, end: end)
+                return (scan, DashboardAggregates(scan.points, now: now, calendar: cal))
             }.value
             guard scan.unreadableFiles == 0 else {
                 throw UsageError.invalid("\(scan.unreadableFiles) log files could not be read. Keeping previous totals; sync will retry.")
             }
+            aggregates = derived
             points = scan.points
             filesScanned = scan.files
             try LocalStore.save(points, name: "mac-history.json")
