@@ -12,6 +12,7 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
+    <Compile Include="..\..\UsageModels.cs" Link="UsageModels.cs" />
     <ProjectReference Include="..\..\src\CodexUsage.Core\CodexUsage.Core.csproj" />
   </ItemGroup>
 </Project>

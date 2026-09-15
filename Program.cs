@@ -55,22 +55,6 @@ internal static class Program
     private static extern bool AttachConsole(uint processId);
 }
 
-internal sealed record UsagePoint(DateTime Time, string Model, string Project, long Input, long Cached, long Output, long Reasoning,
-    long Responses = 1, string Effort = "Unknown")
-{
-    public long Total => Input + Output;
-}
-
-internal sealed record UsageSnapshot(DateTime Day, DateTime RefreshedAt, IReadOnlyList<UsagePoint> Points, int FilesScanned)
-{
-    public long Total => Points.Sum(p => p.Total);
-    public long Input => Points.Sum(p => p.Input);
-    public long Cached => Points.Sum(p => p.Cached);
-    public long Output => Points.Sum(p => p.Output);
-    public long Reasoning => Points.Sum(p => p.Reasoning);
-    public long Responses => Points.Sum(p => p.Responses);
-}
-
 internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects);
 internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
     IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null);
@@ -2073,8 +2057,7 @@ internal sealed class DashboardForm : Form
             Dictionary<string, long[]> byModel;
             if (chartDate == DateTime.Today)
             {
-                byModel = s.Points.GroupBy(p => p.Model).ToDictionary(group => group.Key,
-                    group => Enumerable.Range(0, 24).Select(hour => group.Where(p => p.Time.Hour == hour).Sum(p => p.Total)).ToArray());
+                byModel = s.Aggregates.HourlyModels;
             }
             else
             {
@@ -2217,8 +2200,8 @@ internal sealed class DashboardForm : Form
             {
                 if (!isHistoricalDay)
                 {
-                    ranked = s.Points.Where(p => p.Time.Hour == selected).GroupBy(p => p.Project)
-                        .Select(group => (Name: group.Key, Tokens: group.Sum(p => p.Total)))
+                    ranked = s.Aggregates.HourlyProjects[selected]
+                        .Select(project => (Name: project.Key, Tokens: project.Value))
                         .OrderByDescending(project => project.Tokens).ToList();
                 }
                 else
@@ -2231,8 +2214,8 @@ internal sealed class DashboardForm : Form
             }
             else if (!isHistoricalDay)
             {
-                ranked = s.Points.GroupBy(p => p.Project)
-                    .Select(group => (Name: group.Key, Tokens: group.Sum(p => p.Total)))
+                ranked = s.Aggregates.Projects
+                    .Select(project => (Name: project.Key, Tokens: project.Value))
                     .OrderByDescending(project => project.Tokens).ToList();
             }
             else

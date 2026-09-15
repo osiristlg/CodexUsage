@@ -30,6 +30,7 @@ Hover over the charts for more detail. Select a day in the 30-day chart to inspe
 - Effort travels with encrypted LAN aggregates and is preserved in combined-machine history. Older clients remain compatible. Use **Settings → Network → Force full upload** on each updated client to refresh its last 30 days; rebuilding cannot recover effort absent from the original logs.
 - Hourly tooltips include per-model totals, with improved positioning and bottom padding on Windows.
 - Windows rendering now skips minimized and zero-sized surfaces, fixing the intermittent minimize-time drawing errors.
+- Both clients reuse derived chart aggregates instead of repeatedly scanning usage points during interaction; macOS also skips redundant hover-state updates.
 - macOS fixes improve chart selection and snapshot bars, stabilize credential storage for ad-hoc builds, reduce repeated Keychain prompts, and clarify network errors.
 
 ## Snapshot export
