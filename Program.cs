@@ -2146,20 +2146,13 @@ internal sealed class DashboardForm : Form
                         .FirstOrDefault(hour => hour.Hour == selectedHour)?.Efforts;
                 var efforts = (effortSource ?? new Dictionary<string, long> { ["Unknown"] = totals[selectedHour] })
                     .Where(pair => pair.Value > 0).OrderByDescending(pair => pair.Value).ThenBy(pair => pair.Key).ToArray();
-                var rowSlots = Math.Max(2, (plot.Height - 84) / 18);
-                var effortSlots = Math.Min(efforts.Length, Math.Max(1, rowSlots / 2));
-                var visibleEfforts = efforts.Take(efforts.Length > effortSlots ? Math.Max(0, effortSlots - 1) : effortSlots).ToArray();
-                var hiddenEffortCount = efforts.Length - visibleEfforts.Length;
-                var modelSlots = rowSlots - effortSlots;
-                var visibleModels = activeModels.Take(activeModels.Length > modelSlots ? Math.Max(0, modelSlots - 1) : modelSlots).ToArray();
-                var hiddenModelCount = activeModels.Length - visibleModels.Length;
                 const int tooltipWidth = 230;
-                var modelRows = visibleModels.Length + (hiddenModelCount > 0 ? 1 : 0);
+                var modelRows = activeModels.Length;
                 var tooltipHeight = 54 + modelRows * 18 + (efforts.Length > 0
-                    ? 24 + (visibleEfforts.Length + (hiddenEffortCount > 0 ? 1 : 0)) * 18 : 0);
+                    ? 24 + efforts.Length * 18 : 0);
                 var tooltip = new Rectangle(
                     Math.Clamp((int)(x + barSlot / 2) - tooltipWidth / 2, plot.Left, plot.Right - tooltipWidth),
-                    Math.Clamp((int)barTop - tooltipHeight - 14, plot.Top - 8, plot.Bottom - tooltipHeight - 5),
+                    Math.Clamp((int)barTop - tooltipHeight - 14, 8, Math.Max(8, Height - tooltipHeight - 8)),
                     tooltipWidth, tooltipHeight);
                 FillRound(g, tooltip, 8, Darken(Panel, 4));
                 StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
@@ -2167,9 +2160,9 @@ internal sealed class DashboardForm : Form
                 using var tipValue = new Font("Segoe UI Semibold", 10f);
                 g.DrawString(HourRange(selectedHour), tipLabel, new SolidBrush(TextMuted), tooltip.X + 9, tooltip.Y + 5);
                 g.DrawString($"{totals[selectedHour]:N0} tokens", tipValue, new SolidBrush(TextMain), tooltip.X + 9, tooltip.Y + 21);
-                for (var i = 0; i < visibleModels.Length; i++)
+                for (var i = 0; i < activeModels.Length; i++)
                 {
-                    var model = visibleModels[i];
+                    var model = activeModels[i];
                     var rowY = tooltip.Y + 47 + i * 18;
                     using var dot = new SolidBrush(model.Color);
                     g.FillEllipse(dot, tooltip.X + 10, rowY + 4, 7, 7);
@@ -2181,9 +2174,6 @@ internal sealed class DashboardForm : Form
                         TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
                     g.DrawString(value, tipLabel, new SolidBrush(TextMain), tooltip.Right - valueSize.Width - 10, rowY);
                 }
-                if (hiddenModelCount > 0)
-                    g.DrawString($"+ {hiddenModelCount} more model{(hiddenModelCount == 1 ? "" : "s")}", tipLabel,
-                        new SolidBrush(TextMuted), tooltip.X + 24, tooltip.Y + 47 + visibleModels.Length * 18);
                 if (efforts.Length > 0)
                 {
                     var effortY = tooltip.Y + 47 + modelRows * 18;
@@ -2191,22 +2181,16 @@ internal sealed class DashboardForm : Form
                     g.DrawLine(divider, tooltip.X + 10, effortY + 1, tooltip.Right - 10, effortY + 1);
                     using var headingBrush = new SolidBrush(Theme.Tertiary);
                     g.DrawString("REASONING EFFORT", tipLabel, headingBrush, tooltip.X + 10, effortY + 5);
-                    for (var i = 0; i < visibleEfforts.Length; i++)
+                    for (var i = 0; i < efforts.Length; i++)
                     {
                         var rowY = effortY + 24 + i * 18;
-                        var value = visibleEfforts[i].Value.ToString("N0");
+                        var value = efforts[i].Value.ToString("N0");
                         var valueSize = g.MeasureString(value, tipLabel);
-                        TextRenderer.DrawText(g, visibleEfforts[i].Key, tipLabel,
+                        TextRenderer.DrawText(g, efforts[i].Key, tipLabel,
                             new Rectangle(tooltip.X + 10, rowY, tooltip.Width - 27 - (int)valueSize.Width, 16),
                             TextMuted, TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
                         using var valueBrush = new SolidBrush(TextMain);
                         g.DrawString(value, tipLabel, valueBrush, tooltip.Right - valueSize.Width - 10, rowY);
-                    }
-                    if (hiddenEffortCount > 0)
-                    {
-                        using var mutedBrush = new SolidBrush(TextMuted);
-                        g.DrawString($"+ {hiddenEffortCount} more effort levels", tipLabel, mutedBrush,
-                            tooltip.X + 10, effortY + 24 + visibleEfforts.Length * 18);
                     }
                 }
             }
