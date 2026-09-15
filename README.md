@@ -4,7 +4,7 @@
 
 Codex Usage is a small desktop dashboard that makes Codex activity easier to understand. It turns the usage records already on your computer into clear daily and historical views. There are native versions for Windows and macOS, and your raw conversations stay on the machine where they happened.
 
-Version 1.1 can also bring several computers together on your own local network. You can look at this computer, all computers, or one named computer without sending raw logs to the receiver.
+Version 1.2 can also bring several computers together on your own local network. You can look at this computer, all computers, or one named computer without sending raw logs to the receiver.
 
 The Windows client uses .NET and Windows Forms. A native SwiftUI client for macOS is available in [macOS](macOS/README.md).
 
@@ -14,6 +14,7 @@ The Windows client uses .NET and Windows Forms. A native SwiftUI client for macO
 - Hourly usage grouped by model
 - Usage grouped by project
 - An interactive rolling 30-day history
+- Reasoning-effort breakdowns in the 30-day chart tooltips (separate from reasoning-token counts; hourly charts stay model-only)
 - Historical hourly and project breakdowns
 - Automatic refresh, with a configurable interval
 - Optional encrypted, aggregate-only reporting across machines on the same LAN
@@ -22,6 +23,14 @@ The Windows client uses .NET and Windows Forms. A native SwiftUI client for macO
 - Several built-in visual themes
 
 Hover over the charts for more detail. Select a day in the 30-day chart to inspect it, and use **Rebuild 30 days** when you want to rescan the local history immediately.
+
+## New in 1.2.0
+
+- Daily-history tooltips show logged reasoning effort, such as Light, Medium, and High, on Windows and macOS. Current and older supported log fields are parsed; records without a usable effort value show **Unknown**.
+- Effort travels with encrypted LAN aggregates and is preserved in combined-machine history. Older clients remain compatible. Use **Settings → Network → Force full upload** on each updated client to refresh its last 30 days; rebuilding cannot recover effort absent from the original logs.
+- Hourly tooltips include per-model totals, with improved positioning and bottom padding on Windows.
+- Windows rendering now skips minimized and zero-sized surfaces, fixing the intermittent minimize-time drawing errors.
+- macOS fixes improve chart selection and snapshot bars, stabilize credential storage for ad-hoc builds, reduce repeated Keychain prompts, and clarify network errors.
 
 ## Snapshot export
 
@@ -56,7 +65,7 @@ It does not modify those logs. Unless you explicitly enable LAN reporting, it do
 
 Project names are derived from the working directories recorded in the session logs. They remain local unless you deliberately place an exported snapshot in a shared location or choose **Project names** for LAN reporting. Snapshot export can replace names with generic labels. LAN reporting defaults to stable anonymous project IDs and can instead omit the project breakdown entirely. If you later choose to share project names, the client sends the name alongside its stable private ID so matching anonymous history can be labelled consistently.
 
-LAN reporting transmits only hourly token counts grouped by model and, depending on your privacy setting, project. Raw Codex logs, prompts, responses, filenames, and paths remain on the machine where they were created. The receiver has no endpoint for raw-log upload. See [LAN reporting](docs/lan-reporting.md) for setup and security details.
+LAN reporting transmits only hourly token counts grouped by model, reasoning effort, and, depending on your privacy setting, project. Raw Codex logs, prompts, responses, filenames, and paths remain on the machine where they were created. The receiver has no endpoint for raw-log upload. See [LAN reporting](docs/lan-reporting.md) for setup and security details.
 
 ## LAN reporting
 
@@ -117,6 +126,6 @@ The native macOS client includes local token totals, selectable 30-day history, 
 
 ## Current status
 
-Version 1.1 includes native Windows and macOS dashboards, interactive history, themes, snapshot export on Windows, and optional encrypted aggregate reporting across your local network.
+Version 1.2.0 includes native Windows and macOS dashboards, interactive history with reasoning-effort detail, themes, snapshot export, and optional encrypted aggregate reporting across your local network.
 
 Small utilities, made because we can.

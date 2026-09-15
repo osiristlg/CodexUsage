@@ -1,6 +1,6 @@
 # Codex Usage for macOS
 
-A native SwiftUI and Swift Charts app for macOS 14 or later. Version 1.1.1 can report to a receiver or host the existing .NET/Kestrel receiver for a Mac-only household. The Swift app has no third-party packages.
+A native SwiftUI and Swift Charts app for macOS 14 or later. Version 1.2.0 can report to a receiver or host the existing .NET/Kestrel receiver for a Mac-only household. The Swift app has no third-party packages.
 
 ## Build and run
 
@@ -16,6 +16,8 @@ The script creates an ad-hoc signed app for local development. Distribution sign
 ## Dashboard
 
 - Today's local total, input, cached input, output and reasoning counts.
+- Reasoning-effort totals in the rolling 30-day tooltip; hourly tooltips remain model-only. Missing effort is shown as Unknown.
+- Force full upload in Network settings to refresh the receiver's last 30 days with the updated effort-aware aggregates.
 - A neon rolling 30-day line chart with floating date, total, and per-model tooltips. Click a day to pin or unpin its hourly and project views.
 - Hourly stacked model bars have pointer-tracked totals; hovering an hour or history point synchronizes the project breakdown.
 - Automatic refresh at 15 seconds, 30 seconds, one minute or five minutes, while the app is running.
