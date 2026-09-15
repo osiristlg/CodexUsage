@@ -50,6 +50,15 @@ struct PresentationTests {
         }
         let cached = DashboardAggregates(points, now: day, calendar: calendar)
         expectEqual(cached.days, days)
+        expectEqual(cached.efforts(day: day, hour: 0), today.efforts)
+        expectEqual(cached.efforts(day: day, hour: 1), [:])
+        expectEqual(cached.efforts(day: day.addingTimeInterval(-86400), hour: 0), ["High": 100])
+        expectEqual(mixedCache.efforts(day: day, hour: 0), ["Light": 12])
+        expectEqual(mixedCache.efforts(day: day, hour: 4), ["Unknown": 7])
+        expectEqual(mixedCache.efforts(day: day, hour: 6), ["Unknown": 9])
+        for hour in 0..<24 {
+            expectEqual(mixedCache.efforts(day: day, hour: hour).values.reduce(0, +), mixedCache.hours(day: day).filter { $0.hour == hour }.reduce(Int64(0)) { $0 + $1.total })
+        }
         for selected in [day, day.addingTimeInterval(-86400), day.addingTimeInterval(86400)] {
             expectEqual(cached.hours(day: selected), DashboardPresentation.hours(points, day: selected, calendar: calendar))
             let expected = points.filter { calendar.isDate($0.time, inSameDayAs: selected) }.reduce(Tokens()) { $0 + $1.tokens }
@@ -60,6 +69,7 @@ struct PresentationTests {
         }
         // A new refresh replaces, rather than accumulates, every derived bucket.
         let refreshed = DashboardAggregates(Array(points.prefix(1)), now: day.addingTimeInterval(86400), calendar: calendar)
+        expectEqual(refreshed.efforts(day: day, hour: 0), ["Light": 12])
         expectEqual(refreshed.tokens(day: day).total, 12)
         expectEqual(refreshed.tokens(day: day.addingTimeInterval(-86400)).total, 0)
         expectEqual(refreshed.days.last?.total, 0)

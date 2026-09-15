@@ -23,16 +23,20 @@ public struct ProjectValue: Identifiable, Equatable, Sendable {
 }
 
 public enum DashboardPresentation {
+    private static func effortLabel(_ point: UsagePoint) -> String {
+        let label = point.effort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return label.isEmpty ? "Unknown" : label
+    }
+    public static func effortTotals(_ points: [UsagePoint]) -> [String: Int64] {
+        Dictionary(grouping: points, by: effortLabel).mapValues { $0.reduce(Int64(0)) { $0 + $1.tokens.total } }
+    }
     public static func days(_ points: [UsagePoint], now: Date = Date(), calendar: Calendar = .current) -> [DailyValue] {
         let grouped = Dictionary(grouping: points) { calendar.startOfDay(for: $0.time) }
         return (-29...0).map { offset in
             let day = calendar.date(byAdding: .day, value: offset, to: calendar.startOfDay(for: now))!
             let values = grouped[day] ?? []
             let models = Dictionary(grouping: values, by: \.model).mapValues { $0.reduce(0) { $0 + $1.tokens.total } }
-            let efforts = Dictionary(grouping: values) { point in
-                let label = point.effort?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                return label.isEmpty ? "Unknown" : label
-            }.mapValues { $0.reduce(Int64(0)) { $0 + $1.tokens.total } }
+            let efforts = effortTotals(values)
             return DailyValue(day: day, total: values.reduce(0) { $0 + $1.tokens.total }, models: models, efforts: efforts)
         }
     }
@@ -83,6 +87,7 @@ public struct DashboardAggregates: Sendable {
     private let tokensByDay: [Date: Tokens]
     private let hoursByDay: [Date: [HourValue]]
     private let projectsByDay: [Date: [ProjectValue]]
+    private let effortsByHour: [Date: [Int: [String: Int64]]]
     private let projectsByHour: [Date: [Int: [ProjectValue]]]
 
     public init(_ points: [UsagePoint], now: Date = Date(), calendar: Calendar = .current) {
@@ -97,11 +102,18 @@ public struct DashboardAggregates: Sendable {
         projectsByDay = grouped.mapValues { values in
             DashboardPresentation.projects(values, pinnedDay: values[0].time, hoveredDay: nil, hoveredHour: nil, calendar: calendar)
         }
+        effortsByHour = grouped.mapValues { values in
+            Dictionary(grouping: values) { calendar.component(.hour, from: $0.time) }
+                .mapValues { DashboardPresentation.effortTotals($0) }
+        }
         projectsByHour = grouped.mapValues { values in
             Dictionary(grouping: values) { calendar.component(.hour, from: $0.time) }.mapValues { bucket in
                 DashboardPresentation.projects(bucket, pinnedDay: bucket[0].time, hoveredDay: nil, hoveredHour: nil, calendar: calendar)
             }
         }
+    }
+    public func efforts(day: Date, hour: Int) -> [String: Int64] {
+        effortsByHour[calendar.startOfDay(for: day)]?[hour] ?? [:]
     }
     public func responseCount(day: Date) -> Int { countsByDay[calendar.startOfDay(for: day)] ?? 0 }
     public func tokens(day: Date) -> Tokens { tokensByDay[calendar.startOfDay(for: day)] ?? Tokens() }

@@ -205,6 +205,15 @@ private struct HourlyChart: View {
                         TooltipBox(accent: theme.tertiary) {
                             Text(hourRange(hour)).foregroundStyle(theme.muted)
                             Text("\(totals[hour].formatted()) tokens").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
+                            let efforts = model.aggregates.efforts(day: model.selectedDate ?? Date(), hour: hour)
+                            if !efforts.isEmpty {
+                                Divider().overlay(theme.muted.opacity(0.3))
+                                Text("REASONING EFFORT").font(.system(size: 9, weight: .semibold)).foregroundStyle(theme.tertiary)
+                                ForEach(efforts.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }), id: \.key) { effort, value in
+                                    HStack { Text(effort); Spacer(); Text(count(value)).foregroundStyle(theme.text) }
+                                        .font(.system(size: 10)).foregroundStyle(theme.muted)
+                                }
+                            }
                         }
                     }
             }
