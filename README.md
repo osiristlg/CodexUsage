@@ -24,13 +24,18 @@ The Windows client uses .NET and Windows Forms. A native SwiftUI client for macO
 
 Hover over the charts for more detail. Select a day in the 30-day chart to inspect it, and use **Rebuild 30 days** when you want to rescan the local history immediately.
 
+## New in 1.2.1
+
+- Performance fixes for Windows and macOS: cached chart aggregates avoid repeated usage-point scans during painting and interaction.
+- macOS skips redundant hover-state updates, keeping pointer-driven UI changes responsive.
+- Cached data refreshes when usage changes; token totals, chart scaling, and reasoning-effort detail are preserved.
+
 ## New in 1.2.0
 
 - Daily-history tooltips show logged reasoning effort, such as Light, Medium, and High, on Windows and macOS. Current and older supported log fields are parsed; records without a usable effort value show **Unknown**.
 - Effort travels with encrypted LAN aggregates and is preserved in combined-machine history. Older clients remain compatible. Use **Settings → Network → Force full upload** on each updated client to refresh its last 30 days; rebuilding cannot recover effort absent from the original logs.
 - Hourly tooltips include per-model totals, with improved positioning and bottom padding on Windows.
 - Windows rendering now skips minimized and zero-sized surfaces, fixing the intermittent minimize-time drawing errors.
-- Both clients reuse derived chart aggregates instead of repeatedly scanning usage points during interaction; macOS also skips redundant hover-state updates.
 - macOS fixes improve chart selection and snapshot bars, stabilize credential storage for ad-hoc builds, reduce repeated Keychain prompts, and clarify network errors.
 
 ## Snapshot export
@@ -127,6 +132,6 @@ The native macOS client includes local token totals, selectable 30-day history, 
 
 ## Current status
 
-Version 1.2.0 includes native Windows and macOS dashboards, interactive history with reasoning-effort detail, themes, snapshot export, and optional encrypted aggregate reporting across your local network.
+Version 1.2.1 includes native Windows and macOS dashboards, performance improvements, interactive history with reasoning-effort detail, themes, snapshot export, and optional encrypted aggregate reporting across your local network.
 
 Small utilities, made because we can.

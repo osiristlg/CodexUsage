@@ -1,6 +1,6 @@
 # Codex Usage for macOS
 
-A native SwiftUI and Swift Charts app for macOS 14 or later. Version 1.2.0 can report to a receiver or host the existing .NET/Kestrel receiver for a Mac-only household. The Swift app has no third-party packages.
+A native SwiftUI and Swift Charts app for macOS 14 or later. Version 1.2.1 can report to a receiver or host the existing .NET/Kestrel receiver for a Mac-only household. The Swift app has no third-party packages.
 
 ## Build and run
 
