@@ -2033,7 +2033,15 @@ internal sealed class DashboardForm : Form
                 g.FillEllipse(dot, x, r.Y + 61, 8, 8);
                 g.DrawString(item.Item1, small, new SolidBrush(TextMuted), x + 14, r.Y + 55);
                 using var metric = new Font("Segoe UI Variable Display Semibold", 19f);
-                g.DrawString(Compact(item.Item2), metric, new SolidBrush(TextMain), x, r.Y + 82);
+                var metricText = Compact(item.Item2);
+                g.DrawString(metricText, metric, new SolidBrush(TextMain), x, r.Y + 82);
+                if (item.Item1 == "CACHED" && s.Input > 0)
+                {
+                    var percentage = 100.0 * s.Cached / s.Input;
+                    using var percentageFont = new Font("Segoe UI Semibold", 9f);
+                    g.DrawString($"({percentage:F1}%)", percentageFont, new SolidBrush(TextMuted),
+                        x + g.MeasureString(metricText, metric).Width, r.Y + 94);
+                }
                 x += width;
             }
             if (!string.Equals(sourceLabel, "All machines", StringComparison.OrdinalIgnoreCase) &&
