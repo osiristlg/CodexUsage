@@ -123,7 +123,8 @@ private struct HeroPanel: View {
                 .frame(width: max(270, geometry.size.width * 0.27), alignment: .leading)
                 HStack(spacing: 0) {
                     HeroMetric(title: "INPUT", value: model.todayTokens.input, color: theme.series[0])
-                    HeroMetric(title: "CACHED", value: model.todayTokens.cachedInput, color: theme.series[1])
+                    HeroMetric(title: "CACHED", value: model.todayTokens.cachedInput, color: theme.series[1],
+                               inputForPercentage: model.todayTokens.input)
                     HeroMetric(title: "OUTPUT", value: model.todayTokens.output, color: theme.series[2])
                     HeroMetric(title: "REASONING", value: model.todayTokens.reasoning, color: theme.series[3])
                 }.padding(.top, 32)
@@ -138,13 +139,20 @@ private struct HeroMetric: View {
     let title: String
     let value: Int64
     let color: Color
+    var inputForPercentage: Int64 = 0
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 Circle().fill(color).frame(width: 8, height: 8).shadow(color: color.opacity(0.8), radius: 5)
                 Text(title).font(.system(size: 11, weight: .semibold)).tracking(0.8).foregroundStyle(theme.muted)
             }
-            Text(count(value)).font(.system(size: 25, weight: .semibold, design: .rounded)).monospacedDigit().help(value.formatted())
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(count(value)).font(.system(size: 25, weight: .semibold, design: .rounded)).monospacedDigit().help(value.formatted())
+                if inputForPercentage > 0 {
+                    Text("(\((100 * Double(value) / Double(inputForPercentage)).formatted(.number.precision(.fractionLength(1))))%)")
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.muted)
+                }
+            }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -203,17 +211,29 @@ private struct HourlyChart: View {
                 PointMark(x: .value("Hovered hour", hour), y: .value("Hovered total", totals[hour])).symbolSize(0)
                     .annotation(position: .top, spacing: 8, overflowResolution: .init(x: .fit, y: .disabled)) {
                         TooltipBox(accent: theme.tertiary) {
-                            Text(hourRange(hour)).foregroundStyle(theme.muted)
-                            Text("\(totals[hour].formatted()) tokens").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
-                            let efforts = model.aggregates.efforts(day: model.selectedDate ?? Date(), hour: hour)
-                            if !efforts.isEmpty {
-                                Divider().overlay(theme.muted.opacity(0.3))
-                                Text("REASONING EFFORT").font(.system(size: 9, weight: .semibold)).foregroundStyle(theme.tertiary)
-                                ForEach(efforts.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }), id: \.key) { effort, value in
-                                    HStack { Text(effort); Spacer(); Text(count(value)).foregroundStyle(theme.text) }
-                                        .font(.system(size: 10)).foregroundStyle(theme.muted)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(hourRange(hour)).foregroundStyle(theme.muted)
+                                Text("\(totals[hour].formatted()) tokens").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
+                                ForEach(values.filter { $0.hour == hour }.sorted { left, right in
+                                    (models.firstIndex(of: left.model) ?? 0) < (models.firstIndex(of: right.model) ?? 0)
+                                }) { value in
+                                    HStack(spacing: 5) {
+                                        Circle().fill(color(for: value.model)).frame(width: 6, height: 6)
+                                        Text(value.model).lineLimit(1)
+                                        Spacer(minLength: 4)
+                                        Text(value.total.formatted()).foregroundStyle(theme.text).monospacedDigit()
+                                    }.font(.system(size: 10)).foregroundStyle(theme.muted)
                                 }
-                            }
+                                let efforts = model.aggregates.efforts(day: model.selectedDate ?? Date(), hour: hour)
+                                if !efforts.isEmpty {
+                                    Divider().overlay(theme.muted.opacity(0.3))
+                                    Text("REASONING EFFORT").font(.system(size: 9, weight: .semibold)).foregroundStyle(theme.tertiary)
+                                    ForEach(efforts.sorted(by: { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }), id: \.key) { effort, value in
+                                        HStack { Text(effort); Spacer(); Text(value.formatted()).foregroundStyle(theme.text).monospacedDigit() }
+                                            .font(.system(size: 10)).foregroundStyle(theme.muted)
+                                    }
+                                }
+                            }.frame(width: 220)
                         }
                     }
             }
