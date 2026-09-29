@@ -1,5 +1,13 @@
 namespace CodexUsageDashboard;
 
+internal static class ProjectModelTotals
+{
+    public static Dictionary<string, Dictionary<string, long>> Build(IEnumerable<UsagePoint> points) => points
+        .GroupBy(point => point.Project)
+        .ToDictionary(project => project.Key, project => project.GroupBy(point => point.Model)
+            .ToDictionary(model => model.Key, model => model.Sum(point => point.Total)));
+}
+
 internal sealed record UsagePoint(DateTime Time, string Model, string Project, long Input, long Cached, long Output, long Reasoning,
     long Responses = 1, string Effort = "Unknown")
 {

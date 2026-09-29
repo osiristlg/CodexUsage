@@ -58,8 +58,9 @@ internal static class Program
 internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects,
     Dictionary<string, long>? Efforts = null);
 internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
-    IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null);
-internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 7);
+    IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null,
+    Dictionary<string, Dictionary<string, long>>? ProjectModels = null);
+internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 8);
 
 internal static class LogScanner
 {
@@ -98,7 +99,8 @@ internal static class LogScanner
                 }).ToArray();
                 return new DailyUsage(date, dayPoints.Sum(p => p.Total), dayPoints
                     .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours,
-                    dayPoints.GroupBy(p => p.Effort).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
+                    dayPoints.GroupBy(p => p.Effort).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
+                    ProjectModelTotals.Build(dayPoints));
             }).ToArray();
         return new HistoryCache(DateTime.Now, result);
     }, token);
@@ -337,7 +339,8 @@ internal static class HistoryStore
         var snapshotDay = snapshot.Day.Date;
         var efforts = snapshot.Points.GroupBy(point => point.Effort)
             .ToDictionary(group => group.Key, group => group.Sum(point => point.Total));
-        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours, efforts);
+        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours, efforts,
+            ProjectModelTotals.Build(snapshot.Points));
         var days = cache.Days.Select(day => day.Date.Date == snapshotDay ? today : day).ToList();
         if (!days.Any(day => day.Date.Date == snapshotDay))
         {
@@ -348,7 +351,7 @@ internal static class HistoryStore
     }
 
     public static bool ShouldAutoBuild(HistoryCache? cache) =>
-        cache is null || cache.FormatVersion < 7 ||
+        cache is null || cache.FormatVersion < 8 ||
         (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
 
     public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
@@ -371,7 +374,8 @@ internal static class HistoryStore
             }).ToArray();
             return new DailyUsage(date, dayPoints.Sum(point => point.Total),
                 dayPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)), hours,
-                dayPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
+                dayPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
+                ProjectModelTotals.Build(dayPoints));
         }).ToArray();
         var todayPoints = byDay.GetValueOrDefault(DateTime.Today) ?? [];
         return (new UsageSnapshot(DateTime.Today, DateTime.Now, todayPoints, 0), new HistoryCache(DateTime.Now, days));
@@ -607,6 +611,22 @@ internal sealed class DashboardForm : Form
         rebuild.Click += async (_, _) => await RebuildHistoryAsync();
         view.Click += (_, _) => CycleNetworkView();
         settings.Click += async (_, _) => await ShowSettingsDialogAsync();
+        canvas.ProjectTotalsRequested += (_, _) =>
+        {
+            if (canvas.History is not { FormatVersion: >= 8 } history)
+            {
+                MessageBox.Show(this, "The 30-day history is still rebuilding. Please try again when it finishes.",
+                    "Project totals", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var days = history.Days.Where(day => day.Date.Date >= DateTime.Today.AddDays(-29) &&
+                day.Date.Date <= DateTime.Today);
+            var models = days.SelectMany(day => day.ProjectModels ?? [])
+                .GroupBy(project => project.Key)
+                .ToDictionary(project => project.Key, project => project.SelectMany(day => day.Value)
+                    .GroupBy(model => model.Key).ToDictionary(model => model.Key, model => model.Sum(value => value.Value)));
+            new ProjectTotalsForm(models, canvas.SourceLabel).Show(this);
+        };
         timer.Tick += async (_, _) => await RefreshDataAsync();
         snapshotTimer.Tick += (_, _) => ExportSnapshot();
         Shown += async (_, _) =>
@@ -1803,6 +1823,9 @@ internal sealed class DashboardForm : Form
 
     private sealed class NeonButton : Button
     {
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Color? SurroundColor { get; set; }
         private Color accent;
         private bool hovering;
 
@@ -1825,7 +1848,7 @@ internal sealed class DashboardForm : Form
             if (ClientSize.Width <= 11 || ClientSize.Height <= 11) return;
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent?.BackColor ?? Bg);
+            g.Clear(SurroundColor ?? Parent?.BackColor ?? Bg);
             var bounds = new Rectangle(5, 5, Width - 11, Height - 11);
             using var path = ButtonPath(bounds, 7);
             using var fill = new LinearGradientBrush(bounds,
@@ -1860,6 +1883,9 @@ internal sealed class DashboardForm : Form
 
     private sealed class UsageCanvas : Control
     {
+        private readonly Button projectTotals = MakeButton("30d", 58, Theme.Tertiary);
+        private readonly ToolTip projectTotalsTip = new() { ShowAlways = true };
+        public event EventHandler? ProjectTotalsRequested;
         private static Color[] Palette => Theme.Series;
         private Rectangle historyHitArea;
         private DailyUsage[] historyDays = [];
@@ -1887,6 +1913,25 @@ internal sealed class DashboardForm : Form
             ResizeRedraw = true;
             BackColor = Bg;
             SetStyle(ControlStyles.Selectable, true);
+            projectTotals.AccessibleName = "Open 30-day project totals";
+            projectTotals.Height = 36;
+            projectTotals.Visible = false;
+            projectTotalsTip.SetToolTip(projectTotals, "Total usage by project over the last 30 days");
+            projectTotals.Click += (_, _) => ProjectTotalsRequested?.Invoke(this, EventArgs.Empty);
+            Controls.Add(projectTotals);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            var margin = Math.Max(28, Width / 35);
+            projectTotals.Location = new Point(Width - margin - projectTotals.Width - 12, 244);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) projectTotalsTip.Dispose();
+            base.Dispose(disposing);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -1981,12 +2026,13 @@ internal sealed class DashboardForm : Form
         private void Render(Graphics g, bool hideProjectNames)
         {
             if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            DashboardDrawing.Configure(g);
             using (var background = new LinearGradientBrush(ClientRectangle,
                 Lighten(Bg, 3), Darken(Bg, 4), 35f))
                 g.FillRectangle(background, ClientRectangle);
             DrawAmbientLights(g);
+            ((NeonButton)projectTotals).SurroundColor = Panel;
+            projectTotals.Visible = Snapshot is not null;
             if (Snapshot is null) { DrawCentered(g, "Reading today’s usage…"); return; }
 
             var margin = Math.Max(28, Width / 35);
@@ -2016,8 +2062,11 @@ internal sealed class DashboardForm : Form
             using var label = new Font("Segoe UI Semibold", 10f);
             using var value = new Font("Segoe UI Variable Display", 37f, FontStyle.Bold);
             using var small = new Font("Segoe UI Semibold", 10f);
-            g.DrawString("TODAY’S TOKEN USAGE", label, new SolidBrush(TextMuted), r.X + 28, r.Y + 24);
-            g.DrawString(Compact(s.Total), value, new SolidBrush(TextMain), r.X + 24, r.Y + 47);
+            using var mutedBrush = new SolidBrush(TextMuted);
+            using var mainBrush = new SolidBrush(TextMain);
+            using var tertiaryBrush = new SolidBrush(Theme.Tertiary);
+            g.DrawString("TODAY’S TOKEN USAGE", label, mutedBrush, r.X + 28, r.Y + 24);
+            g.DrawString(Compact(s.Total), value, mainBrush, r.X + 24, r.Y + 47);
             var cards = new[]
             {
                 ("INPUT", s.Input, Palette[0]),
@@ -2031,15 +2080,15 @@ internal sealed class DashboardForm : Form
             {
                 using var dot = new SolidBrush(item.Item3);
                 g.FillEllipse(dot, x, r.Y + 61, 8, 8);
-                g.DrawString(item.Item1, small, new SolidBrush(TextMuted), x + 14, r.Y + 55);
+                g.DrawString(item.Item1, small, mutedBrush, x + 14, r.Y + 55);
                 using var metric = new Font("Segoe UI Variable Display Semibold", 19f);
                 var metricText = Compact(item.Item2);
-                g.DrawString(metricText, metric, new SolidBrush(TextMain), x, r.Y + 82);
+                g.DrawString(metricText, metric, mainBrush, x, r.Y + 82);
                 if (item.Item1 == "CACHED" && s.Input > 0)
                 {
                     var percentage = 100.0 * s.Cached / s.Input;
                     using var percentageFont = new Font("Segoe UI Semibold", 9f);
-                    g.DrawString($"({percentage:F1}%)", percentageFont, new SolidBrush(TextMuted),
+                    g.DrawString($"({percentage:F1}%)", percentageFont, mutedBrush,
                         x + g.MeasureString(metricText, metric).Width, r.Y + 94);
                 }
                 x += width;
@@ -2049,22 +2098,23 @@ internal sealed class DashboardForm : Form
             {
                 using var global = new Font("Segoe UI Semibold", 9f);
                 g.DrawString($"ALL MACHINES  {Compact(combined.Total)}  ·  synced {received.ToLocalTime():h:mm tt}", global,
-                    new SolidBrush(Theme.Tertiary), r.X + 29, r.Bottom - 61);
+                    tertiaryBrush, r.X + 29, r.Bottom - 61);
             }
             var detail = string.Equals(sourceLabel, "This PC", StringComparison.OrdinalIgnoreCase)
                 ? $"{s.Responses:N0} responses across {s.FilesScanned:N0} log files"
                 : $"{s.Responses:N0} responses  ·  {sourceLabel}";
-            g.DrawString(detail, small,
-                new SolidBrush(TextMuted), r.X + 29, r.Bottom - 38);
+            g.DrawString(detail, small, mutedBrush, r.X + 29, r.Bottom - 38);
         }
 
         private void DrawChart(Graphics g, Rectangle r, UsageSnapshot s, HistoryCache? history, DateTime? selectedDate)
         {
             using var title = new Font("Segoe UI Semibold", 12f);
             using var caption = new Font("Segoe UI", 9f);
+            using var mutedBrush = new SolidBrush(TextMuted);
+            using var mainBrush = new SolidBrush(TextMain);
             var chartDate = selectedDate?.Date ?? DateTime.Today;
             var heading = chartDate == DateTime.Today ? "Usage through the day" : $"Usage through {chartDate:MMM d}";
-            g.DrawString(heading, title, new SolidBrush(TextMain), r.X + 28, r.Y + 22);
+            g.DrawString(heading, title, mainBrush, r.X + 28, r.Y + 22);
 
             Dictionary<string, long[]> byModel;
             if (chartDate == DateTime.Today)
@@ -2108,7 +2158,7 @@ internal sealed class DashboardForm : Form
                 g.DrawLine(gridPen, plot.Left, y, plot.Right, y);
                 var label = Compact(niceMax * i / 4);
                 var sz = g.MeasureString(label, caption);
-                g.DrawString(label, caption, new SolidBrush(TextMuted), plot.Left - sz.Width - 10, y - sz.Height / 2);
+                g.DrawString(label, caption, mutedBrush, plot.Left - sz.Width - 10, y - sz.Height / 2);
             }
 
             var barSlot = plot.Width / 24f;
@@ -2166,8 +2216,8 @@ internal sealed class DashboardForm : Form
                 StrokeRound(g, tooltip, 8, Color.FromArgb(145, Theme.Tertiary));
                 using var tipLabel = new Font("Segoe UI Semibold", 8.5f);
                 using var tipValue = new Font("Segoe UI Semibold", 10f);
-                g.DrawString(HourRange(selectedHour), tipLabel, new SolidBrush(TextMuted), tooltip.X + 9, tooltip.Y + 5);
-                g.DrawString($"{totals[selectedHour]:N0} tokens", tipValue, new SolidBrush(TextMain), tooltip.X + 9, tooltip.Y + 21);
+                g.DrawString(HourRange(selectedHour), tipLabel, mutedBrush, tooltip.X + 9, tooltip.Y + 5);
+                g.DrawString($"{totals[selectedHour]:N0} tokens", tipValue, mainBrush, tooltip.X + 9, tooltip.Y + 21);
                 for (var i = 0; i < activeModels.Length; i++)
                 {
                     var model = activeModels[i];
@@ -2180,7 +2230,7 @@ internal sealed class DashboardForm : Form
                     TextRenderer.DrawText(g, model.Key, tipLabel, nameBounds, TextMuted,
                         TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
                         TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
-                    g.DrawString(value, tipLabel, new SolidBrush(TextMain), tooltip.Right - valueSize.Width - 10, rowY);
+                    g.DrawString(value, tipLabel, mainBrush, tooltip.Right - valueSize.Width - 10, rowY);
                 }
                 if (efforts.Length > 0)
                 {
@@ -2207,7 +2257,7 @@ internal sealed class DashboardForm : Form
                 var text = h == 0 ? "12a" : h < 12 ? $"{h}a" : h == 12 ? "12p" : $"{h - 12}p";
                 var sz = g.MeasureString(text, caption);
                 var x = plot.Left + (h + .5f) * barSlot - sz.Width / 2;
-                g.DrawString(text, caption, new SolidBrush(TextMuted), x, plot.Bottom + 10);
+                g.DrawString(text, caption, mutedBrush, x, plot.Bottom + 10);
             }
             if (totals.All(total => total == 0)) DrawCentered(g, $"No token usage recorded on {chartDate:MMM d}", plot);
         }
@@ -2218,14 +2268,17 @@ internal sealed class DashboardForm : Form
             using var title = new Font("Segoe UI Semibold", 12f);
             using var label = new Font("Segoe UI Semibold", 9f);
             using var caption = new Font("Segoe UI", 8.5f);
-            g.DrawString("Usage by project", title, new SolidBrush(TextMain), r.X + 24, r.Y + 22);
+            using var mutedBrush = new SolidBrush(TextMuted);
+            using var mainBrush = new SolidBrush(TextMain);
+            using var tertiaryBrush = new SolidBrush(Theme.Tertiary);
+            g.DrawString("Usage by project", title, mainBrush, r.X + 24, r.Y + 22);
             var effectiveDate = (selectedDate ?? pinnedDate ?? DateTime.Today).Date;
             var isHistoricalDay = effectiveDate != DateTime.Today;
             var dateLabel = selectedHour is { } hour
                 ? $"{effectiveDate:MMM d} · {ShortHourRange(hour)}".ToUpperInvariant()
                 : isHistoricalDay ? effectiveDate.ToString("MMM d").ToUpperInvariant() : "TODAY";
-            var dateSize = g.MeasureString(dateLabel, caption);
-            g.DrawString(dateLabel, caption, new SolidBrush(Theme.Tertiary), r.Right - dateSize.Width - 24, r.Y + 27);
+            if (selectedHour is not null || isHistoricalDay)
+                g.DrawString(dateLabel, caption, tertiaryBrush, r.X + 24, r.Y + 49);
 
             List<(string Name, long Tokens)> ranked;
             if (selectedHour is { } selected)
@@ -2282,7 +2335,7 @@ internal sealed class DashboardForm : Form
                 var displayName = hideProjectNames && item.Name != "Other" ? $"Project {i + 1}" : item.Name;
                 TextRenderer.DrawText(g, displayName, label, nameRect, TextMain,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
-                g.DrawString(value, caption, new SolidBrush(TextMuted), right - valueSize.Width, y + 1);
+                g.DrawString(value, caption, mutedBrush, right - valueSize.Width, y + 1);
 
                 var track = new RectangleF(left, y + 23, right - left, 7);
                 using var trackBrush = new SolidBrush(Color.FromArgb(45, TextMuted));
@@ -2302,13 +2355,15 @@ internal sealed class DashboardForm : Form
         {
             using var title = new Font("Segoe UI Semibold", 12f);
             using var caption = new Font("Segoe UI", 9f);
-            g.DrawString("Rolling 30-day usage", title, new SolidBrush(TextMain), r.X + 28, r.Y + 22);
+            using var mutedBrush = new SolidBrush(TextMuted);
+            using var mainBrush = new SolidBrush(TextMain);
+            g.DrawString("Rolling 30-day usage", title, mainBrush, r.X + 28, r.Y + 22);
             if (history is null)
             {
                 DrawCentered(g, "Building daily history…", Rectangle.FromLTRB(r.X, r.Y + 55, r.Right, r.Bottom));
                 return;
             }
-            g.DrawString($"Built {history.BuiltAt:MMM d, h:mm tt}", caption, new SolidBrush(TextMuted), r.Right - 145, r.Y + 27);
+            g.DrawString($"Built {history.BuiltAt:MMM d, h:mm tt}", caption, mutedBrush, r.Right - 145, r.Y + 27);
             var plot = Rectangle.FromLTRB(r.X + 60, r.Y + 72, r.Right - 28, r.Bottom - 42);
             var days = history.Days.OrderBy(d => d.Date).ToArray();
             historyHitArea = plot;
@@ -2322,7 +2377,7 @@ internal sealed class DashboardForm : Form
                 g.DrawLine(gridPen, plot.Left, y, plot.Right, y);
                 var label = Compact(niceMax * i / 4);
                 var size = g.MeasureString(label, caption);
-                g.DrawString(label, caption, new SolidBrush(TextMuted), plot.Left - size.Width - 10, y - size.Height / 2);
+                g.DrawString(label, caption, mutedBrush, plot.Left - size.Width - 10, y - size.Height / 2);
             }
             if (days.Length > 1)
             {
@@ -2397,9 +2452,9 @@ internal sealed class DashboardForm : Form
                         using var tipDate = new Font("Segoe UI Semibold", 8.5f);
                         using var tipValue = new Font("Segoe UI Semibold", 10f);
                         g.DrawString(days[index].Date.ToString("dddd, MMM d"), tipDate,
-                            new SolidBrush(TextMuted), tooltip.X + 10, tooltip.Y + 6);
+                            mutedBrush, tooltip.X + 10, tooltip.Y + 6);
                         g.DrawString($"{days[index].Tokens:N0} tokens", tipValue,
-                            new SolidBrush(TextMain), tooltip.X + 10, tooltip.Y + 23);
+                            mainBrush, tooltip.X + 10, tooltip.Y + 23);
                         using var modelFont = new Font("Segoe UI", 8.5f);
                         for (var modelIndex = 0; modelIndex < visibleModels.Length; modelIndex++)
                         {
@@ -2415,17 +2470,17 @@ internal sealed class DashboardForm : Form
                             TextRenderer.DrawText(g, model.Name, modelFont, nameRect, TextMuted,
                                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
                                 TextFormatFlags.NoPadding);
-                            g.DrawString(valueText, modelFont, new SolidBrush(TextMain),
+                            g.DrawString(valueText, modelFont, mainBrush,
                                 tooltip.Right - valueSize.Width - 11, rowY);
                         }
                         if (hiddenModelCount > 0)
                             g.DrawString($"+ {hiddenModelCount} more model{(hiddenModelCount == 1 ? "" : "s")}", modelFont,
-                                new SolidBrush(TextMuted), tooltip.X + 25, tooltip.Y + 48 + visibleModels.Length * 20);
+                                mutedBrush, tooltip.X + 25, tooltip.Y + 48 + visibleModels.Length * 20);
 
                         var effortTop = tooltip.Y + 52 + modelRows * 20;
                         using var divider = new Pen(Color.FromArgb(45, TextMuted), 1f);
                         g.DrawLine(divider, tooltip.X + 10, effortTop - 5, tooltip.Right - 10, effortTop - 5);
-                        g.DrawString("REASONING EFFORT", tipDate, new SolidBrush(TextMuted), tooltip.X + 10, effortTop);
+                        g.DrawString("REASONING EFFORT", tipDate, mutedBrush, tooltip.X + 10, effortTop);
                         for (var effortIndex = 0; effortIndex < effortTotals.Length; effortIndex++)
                         {
                             var effort = effortTotals[effortIndex];
@@ -2439,10 +2494,10 @@ internal sealed class DashboardForm : Form
                             };
                             using var effortDot = new SolidBrush(color);
                             g.FillEllipse(effortDot, tooltip.X + 11, rowY + 4, 7, 7);
-                            g.DrawString(effort.Key, modelFont, new SolidBrush(TextMuted), tooltip.X + 25, rowY);
+                            g.DrawString(effort.Key, modelFont, mutedBrush, tooltip.X + 25, rowY);
                             var valueText = Compact(effort.Value);
                             var valueSize = g.MeasureString(valueText, modelFont);
-                            g.DrawString(valueText, modelFont, new SolidBrush(TextMain),
+                            g.DrawString(valueText, modelFont, mainBrush,
                                 tooltip.Right - valueSize.Width - 11, rowY);
                         }
                     }
@@ -2454,7 +2509,7 @@ internal sealed class DashboardForm : Form
                 var text = days[i].Date.ToString("MMM d");
                 var size = g.MeasureString(text, caption);
                 var x = plot.Left + i * plot.Width / Math.Max(1f, days.Length - 1) - size.Width / 2;
-                g.DrawString(text, caption, new SolidBrush(TextMuted), x, plot.Bottom + 10);
+                g.DrawString(text, caption, mutedBrush, x, plot.Bottom + 10);
             }
         }
 
@@ -2568,9 +2623,10 @@ internal sealed class DashboardForm : Form
         private static void DrawCentered(Graphics g, string text, Rectangle? rect = null)
         {
             using var font = new Font("Segoe UI", 11f);
+            using var mutedBrush = new SolidBrush(TextMuted);
             var bounds = rect ?? new Rectangle(0, 0, (int)g.VisibleClipBounds.Width, (int)g.VisibleClipBounds.Height);
             var size = g.MeasureString(text, font);
-            g.DrawString(text, font, new SolidBrush(TextMuted), bounds.Left + (bounds.Width - size.Width) / 2,
+            g.DrawString(text, font, mutedBrush, bounds.Left + (bounds.Width - size.Width) / 2,
                 bounds.Top + (bounds.Height - size.Height) / 2);
         }
     }
