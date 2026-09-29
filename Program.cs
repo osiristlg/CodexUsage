@@ -58,8 +58,9 @@ internal static class Program
 internal sealed record HourlyUsage(int Hour, long Tokens, Dictionary<string, long> Models, Dictionary<string, long> Projects,
     Dictionary<string, long>? Efforts = null);
 internal sealed record DailyUsage(DateTime Date, long Tokens, Dictionary<string, long>? Projects = null,
-    IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null);
-internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 7);
+    IReadOnlyList<HourlyUsage>? Hours = null, Dictionary<string, long>? Efforts = null,
+    Dictionary<string, Dictionary<string, long>>? ProjectModels = null);
+internal sealed record HistoryCache(DateTime BuiltAt, IReadOnlyList<DailyUsage> Days, int FormatVersion = 8);
 
 internal static class LogScanner
 {
@@ -98,7 +99,8 @@ internal static class LogScanner
                 }).ToArray();
                 return new DailyUsage(date, dayPoints.Sum(p => p.Total), dayPoints
                     .GroupBy(p => p.Project).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)), hours,
-                    dayPoints.GroupBy(p => p.Effort).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)));
+                    dayPoints.GroupBy(p => p.Effort).ToDictionary(g => g.Key, g => g.Sum(p => p.Total)),
+                    ProjectModelTotals.Build(dayPoints));
             }).ToArray();
         return new HistoryCache(DateTime.Now, result);
     }, token);
@@ -337,7 +339,8 @@ internal static class HistoryStore
         var snapshotDay = snapshot.Day.Date;
         var efforts = snapshot.Points.GroupBy(point => point.Effort)
             .ToDictionary(group => group.Key, group => group.Sum(point => point.Total));
-        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours, efforts);
+        var today = new DailyUsage(snapshotDay, snapshot.Total, projects, hours, efforts,
+            ProjectModelTotals.Build(snapshot.Points));
         var days = cache.Days.Select(day => day.Date.Date == snapshotDay ? today : day).ToList();
         if (!days.Any(day => day.Date.Date == snapshotDay))
         {
@@ -348,7 +351,7 @@ internal static class HistoryStore
     }
 
     public static bool ShouldAutoBuild(HistoryCache? cache) =>
-        cache is null || cache.FormatVersion < 7 ||
+        cache is null || cache.FormatVersion < 8 ||
         (DateTime.Now.Hour >= 2 && cache.BuiltAt.Date < DateTime.Today);
 
     public static (UsageSnapshot Snapshot, HistoryCache History) FromAggregates(IReadOnlyList<AggregateRow> rows)
@@ -371,7 +374,8 @@ internal static class HistoryStore
             }).ToArray();
             return new DailyUsage(date, dayPoints.Sum(point => point.Total),
                 dayPoints.GroupBy(point => point.Project).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)), hours,
-                dayPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)));
+                dayPoints.GroupBy(point => point.Effort).ToDictionary(group => group.Key, group => group.Sum(point => point.Total)),
+                ProjectModelTotals.Build(dayPoints));
         }).ToArray();
         var todayPoints = byDay.GetValueOrDefault(DateTime.Today) ?? [];
         return (new UsageSnapshot(DateTime.Today, DateTime.Now, todayPoints, 0), new HistoryCache(DateTime.Now, days));
@@ -607,6 +611,22 @@ internal sealed class DashboardForm : Form
         rebuild.Click += async (_, _) => await RebuildHistoryAsync();
         view.Click += (_, _) => CycleNetworkView();
         settings.Click += async (_, _) => await ShowSettingsDialogAsync();
+        canvas.ProjectTotalsRequested += (_, _) =>
+        {
+            if (canvas.History is not { FormatVersion: >= 8 } history)
+            {
+                MessageBox.Show(this, "The 30-day history is still rebuilding. Please try again when it finishes.",
+                    "Project totals", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var days = history.Days.Where(day => day.Date.Date >= DateTime.Today.AddDays(-29) &&
+                day.Date.Date <= DateTime.Today);
+            var models = days.SelectMany(day => day.ProjectModels ?? [])
+                .GroupBy(project => project.Key)
+                .ToDictionary(project => project.Key, project => project.SelectMany(day => day.Value)
+                    .GroupBy(model => model.Key).ToDictionary(model => model.Key, model => model.Sum(value => value.Value)));
+            new ProjectTotalsForm(models, canvas.SourceLabel).Show(this);
+        };
         timer.Tick += async (_, _) => await RefreshDataAsync();
         snapshotTimer.Tick += (_, _) => ExportSnapshot();
         Shown += async (_, _) =>
@@ -1803,6 +1823,9 @@ internal sealed class DashboardForm : Form
 
     private sealed class NeonButton : Button
     {
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Color? SurroundColor { get; set; }
         private Color accent;
         private bool hovering;
 
@@ -1825,7 +1848,7 @@ internal sealed class DashboardForm : Form
             if (ClientSize.Width <= 11 || ClientSize.Height <= 11) return;
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent?.BackColor ?? Bg);
+            g.Clear(SurroundColor ?? Parent?.BackColor ?? Bg);
             var bounds = new Rectangle(5, 5, Width - 11, Height - 11);
             using var path = ButtonPath(bounds, 7);
             using var fill = new LinearGradientBrush(bounds,
@@ -1860,6 +1883,9 @@ internal sealed class DashboardForm : Form
 
     private sealed class UsageCanvas : Control
     {
+        private readonly Button projectTotals = MakeButton("30d", 58, Theme.Tertiary);
+        private readonly ToolTip projectTotalsTip = new() { ShowAlways = true };
+        public event EventHandler? ProjectTotalsRequested;
         private static Color[] Palette => Theme.Series;
         private Rectangle historyHitArea;
         private DailyUsage[] historyDays = [];
@@ -1887,6 +1913,25 @@ internal sealed class DashboardForm : Form
             ResizeRedraw = true;
             BackColor = Bg;
             SetStyle(ControlStyles.Selectable, true);
+            projectTotals.AccessibleName = "Open 30-day project totals";
+            projectTotals.Height = 36;
+            projectTotals.Visible = false;
+            projectTotalsTip.SetToolTip(projectTotals, "Total usage by project over the last 30 days");
+            projectTotals.Click += (_, _) => ProjectTotalsRequested?.Invoke(this, EventArgs.Empty);
+            Controls.Add(projectTotals);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            var margin = Math.Max(28, Width / 35);
+            projectTotals.Location = new Point(Width - margin - projectTotals.Width - 12, 244);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) projectTotalsTip.Dispose();
+            base.Dispose(disposing);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -1981,12 +2026,13 @@ internal sealed class DashboardForm : Form
         private void Render(Graphics g, bool hideProjectNames)
         {
             if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            DashboardDrawing.Configure(g);
             using (var background = new LinearGradientBrush(ClientRectangle,
                 Lighten(Bg, 3), Darken(Bg, 4), 35f))
                 g.FillRectangle(background, ClientRectangle);
             DrawAmbientLights(g);
+            ((NeonButton)projectTotals).SurroundColor = Panel;
+            projectTotals.Visible = Snapshot is not null;
             if (Snapshot is null) { DrawCentered(g, "Reading today’s usage…"); return; }
 
             var margin = Math.Max(28, Width / 35);
@@ -2231,8 +2277,8 @@ internal sealed class DashboardForm : Form
             var dateLabel = selectedHour is { } hour
                 ? $"{effectiveDate:MMM d} · {ShortHourRange(hour)}".ToUpperInvariant()
                 : isHistoricalDay ? effectiveDate.ToString("MMM d").ToUpperInvariant() : "TODAY";
-            var dateSize = g.MeasureString(dateLabel, caption);
-            g.DrawString(dateLabel, caption, tertiaryBrush, r.Right - dateSize.Width - 24, r.Y + 27);
+            if (selectedHour is not null || isHistoricalDay)
+                g.DrawString(dateLabel, caption, tertiaryBrush, r.X + 24, r.Y + 49);
 
             List<(string Name, long Tokens)> ranked;
             if (selectedHour is { } selected)
