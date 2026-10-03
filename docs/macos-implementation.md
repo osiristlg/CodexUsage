@@ -55,4 +55,23 @@ Remaining platform validation:
 
 - Distribution signing/notarization and testing on Intel hardware or macOS 14.
 
-The native UI carries the Windows dashboard's exact color palettes, visual hierarchy, hover and pinned-selection behavior into SwiftUI while retaining Mac-native windows, sheets, menus, folder panels, pointer events, and typography. The receiver, scanner, protocol, storage, and Windows sources remain unchanged by the parity campaign.
+The native UI carries the Windows dashboard's color palettes, visual hierarchy, hover and pinned-selection behavior into SwiftUI while retaining Mac-native windows, sheets, menus, folder panels, pointer events, and typography.
+
+## Scanner profiling — October 2, 2026
+
+Release-mode measurements on the local Mac, using 467 live session files (approximately 1.43 GB):
+
+| Scan | Elapsed | Files parsed | Bytes read |
+| --- | ---: | ---: | ---: |
+| Original full scan | 140.90 s | 467 | Entire collection |
+| Optimized cold scan | 6.00 s | 467 | 1,431,302,158 |
+| Cached refresh with active sessions | 0.345 s | 3 | 36,458,292 |
+| Cached refresh without changes | 0.100 s | 0 | 0 |
+
+These are scanner measurements, not complete refresh times; aggregation, saving and encrypted receiver exchange run afterward. Logs continued growing during measurements, so event counts and bytes differ slightly between runs.
+
+CPU sampling first showed roughly 81% of the sampled scanner thread in Unicode substring searches. Byte filtering removed that cost. A second sample then showed roughly 92% in the generic `Data.firstIndex` newline search. Bounded `memchr` replaces per-byte storage access. Timestamp formatters are reused within each file, and per-chunk autorelease pools release temporary Foundation objects during background parsing.
+
+An actor owns the in-memory file cache. Cache entries contain file identity, size, modification/creation times, calendar range and derived usage only. Changed files are reparsed in full; no append-only assumption is made. Files changed during parsing are not cached. Deleted files are removed, unreadable files block publishing replacement totals, and explicit rebuilds discard cached entries. Regression checks cover append, partial final lines, token-format precedence, replacement, truncation, deletion, day rollover, forced rebuild, CRLF and read-buffer boundaries.
+
+The project panel now contains a scrollable list within the shared chart height, preserving the dashboard's 19-point gaps as project counts increase.

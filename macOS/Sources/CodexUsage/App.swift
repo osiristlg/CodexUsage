@@ -17,6 +17,11 @@ import AppKit
                 Button("Rebuild 30 days") { Task { await model.refresh(force: true) } }.disabled(model.busy)
             }
         }
+        Window("30-day project totals", id: "project-totals") {
+            ProjectTotalsView(model: model)
+                .environment(\.dashboardTheme, DashboardTheme.resolve(model.settings.appearance))
+                .preferredColorScheme(.dark)
+        }.defaultSize(width: 860, height: 680)
         Settings { SettingsView(model: model) }
     }
 }

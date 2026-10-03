@@ -82,6 +82,7 @@ public enum DashboardPresentation {
 /// Immutable derived data. Build once when history changes; interaction only looks up buckets.
 public struct DashboardAggregates: Sendable {
     public let days: [DailyValue]
+    public let rollingProjects: [ProjectTotal]
     private let calendar: Calendar
     private let countsByDay: [Date: Int]
     private let tokensByDay: [Date: Tokens]
@@ -90,11 +91,26 @@ public struct DashboardAggregates: Sendable {
     private let effortsByHour: [Date: [Int: [String: Int64]]]
     private let projectsByHour: [Date: [Int: [ProjectValue]]]
 
-    public init(_ points: [UsagePoint], now: Date = Date(), calendar: Calendar = .current) {
+    public init(rows: [AggregateRow], now: Date = Date(), calendar: Calendar = .current) {
+        self.init(UsagePoint.fromAggregates(rows), now: now, calendar: calendar, responseCountsFromTokens: true)
+    }
+    public init(_ points: [UsagePoint], now: Date = Date(), calendar: Calendar = .current, responseCountsFromTokens: Bool = false) {
         self.calendar = calendar
         days = DashboardPresentation.days(points, now: now, calendar: calendar)
+        let today = calendar.startOfDay(for: now)
+        let start = calendar.date(byAdding: .day, value: -29, to: today)!
+        let end = calendar.date(byAdding: .day, value: 1, to: today)!
+        let projects = Dictionary(grouping: points.filter { $0.time >= start && $0.time < end }, by: \.project)
+            .mapValues { Dictionary(grouping: $0, by: \.model).mapValues { $0.reduce(Int64(0)) { $0 + $1.tokens.total } } }
+        let grandTotal = projects.values.reduce(Int64(0)) { $0 + $1.values.reduce(0, +) }
+        rollingProjects = projects.map { name, models in
+            let total = models.values.reduce(Int64(0), +)
+            return ProjectTotal(name: name, total: total, share: grandTotal > 0 ? Double(total) / Double(grandTotal) : 0, models: models)
+        }.sorted { $0.total == $1.total ? $0.name < $1.name : $0.total > $1.total }
         let grouped = Dictionary(grouping: points) { calendar.startOfDay(for: $0.time) }
-        countsByDay = grouped.mapValues { $0.count }
+        countsByDay = grouped.mapValues { values in
+            responseCountsFromTokens ? Int(values.reduce(Int64(0)) { $0 + $1.tokens.responses }) : values.count
+        }
         tokensByDay = grouped.mapValues { $0.reduce(Tokens()) { $0 + $1.tokens } }
         hoursByDay = grouped.mapValues { values in
             DashboardPresentation.hours(values, day: values[0].time, calendar: calendar)
@@ -123,4 +139,12 @@ public struct DashboardAggregates: Sendable {
         if let hour { return projectsByHour[key]?[hour] ?? [] }
         return projectsByDay[key] ?? []
     }
+}
+
+public struct ProjectTotal: Identifiable, Equatable, Sendable {
+    public var id: String { name }
+    public let name: String
+    public let total: Int64
+    public let share: Double
+    public let models: [String: Int64]
 }

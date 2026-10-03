@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 public struct UsagePoint: Codable, Sendable {
     public var time: Date
@@ -7,16 +8,60 @@ public struct UsagePoint: Codable, Sendable {
     public var project: String
     public var tokens: Tokens
     public var effort: String?
+    public init(time: Date, model: String, project: String, tokens: Tokens, effort: String? = nil) {
+        self.time = time; self.model = model; self.project = project; self.tokens = tokens; self.effort = effort
+    }
+    public static func fromAggregates(_ rows: [AggregateRow]) -> [UsagePoint] {
+        rows.compactMap { row in
+            guard let time = WireTime.date(row.bucketStartUtc) else { return nil }
+            return UsagePoint(time: time, model: row.model, project: row.project, tokens: row.tokens, effort: row.effort)
+        }
+    }
 }
 public struct ScanResult: Sendable {
     public var points: [UsagePoint] = []
     public var files = 0
     public var unreadableFiles = 0
     public var malformedRecords = 0
+    public var filesParsed = 0
+    public var bytesRead: Int64 = 0
+}
+/// Keeps only derived usage and file metadata in memory. Changed files are reparsed
+/// in full, so rewrites, truncation and token-format precedence remain correct.
+public actor CachedLogScanner {
+    private var entries: [String: LogScanner.FileCache] = [:]
+    public init() {}
+    public func scan(folder: URL, start: Date, end: Date, force: Bool = false) throws -> ScanResult {
+        if force { entries.removeAll() }
+        return try LogScanner.scan(folder: folder, start: start, end: end, cache: &entries)
+    }
 }
 public enum LogScanner {
+    fileprivate struct FileStamp: Equatable {
+        let size: Int64
+        let modified: Date
+        let created: Date
+        let inode: UInt64
+        init(_ file: URL) throws {
+            let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+            size = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+            modified = attributes[.modificationDate] as? Date ?? .distantPast
+            created = attributes[.creationDate] as? Date ?? .distantPast
+            inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        }
+    }
+    fileprivate struct FileCache {
+        let stamp: FileStamp
+        let start: Date
+        let end: Date
+        let result: ScanResult
+    }
     public static var defaultFolder: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions") }
     public static func scan(folder: URL, start: Date, end: Date) throws -> ScanResult {
+        var cache: [String: FileCache] = [:]
+        return try scan(folder: folder, start: start, end: end, cache: &cache)
+    }
+    fileprivate static func scan(folder: URL, start: Date, end: Date, cache: inout [String: FileCache]) throws -> ScanResult {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw UsageError.invalid("Session folder does not exist. Choose a readable Codex sessions folder.")
@@ -27,15 +72,29 @@ public enum LogScanner {
             throw UsageError.invalid("Session folder could not be read.")
         }
         var result = ScanResult()
+        var seen = Set<String>()
         for case let file as URL in files where file.pathExtension == "jsonl" {
             try Task.checkCancellation()
             result.files += 1
+            seen.insert(file.path)
             do {
+                guard FileManager.default.isReadableFile(atPath: file.path) else { throw UsageError.invalid("Unreadable session file.") }
+                let stamp = try FileStamp(file)
+                if let entry = cache[file.path], entry.stamp == stamp, entry.start == start, entry.end == end {
+                    result.points += entry.result.points
+                    result.malformedRecords += entry.result.malformedRecords
+                    continue
+                }
                 let parsed = try parseFile(file, start: start, end: end)
                 result.points += parsed.points; result.malformedRecords += parsed.malformedRecords
+                result.filesParsed += 1; result.bytesRead += parsed.bytesRead
+                if try FileStamp(file) == stamp {
+                    cache[file.path] = FileCache(stamp: stamp, start: start, end: end, result: parsed)
+                } else { cache.removeValue(forKey: file.path) }
             } catch is CancellationError { throw CancellationError() }
-            catch { result.unreadableFiles += 1 }
+            catch { cache.removeValue(forKey: file.path); result.unreadableFiles += 1 }
         }
+        cache = cache.filter { seen.contains($0.key) }
         result.unreadableFiles += enumerationErrors
         return result
     }
@@ -46,17 +105,32 @@ public enum LogScanner {
         var parser = Parser(start: start, end: end)
         var buffer = Data()
         var skippingOversizedLine = false
+        var bytesRead: Int64 = 0
         while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
+            bytesRead += Int64(chunk.count)
             try Task.checkCancellation()
             buffer.append(chunk)
-            while let newline = buffer.firstIndex(of: 10) {
-                if !skippingOversizedLine { parser.consume(Data(buffer[..<newline])) }
-                buffer.removeSubrange(...newline); skippingOversizedLine = false
+            autoreleasepool {
+                while let newline = newlineIndex(in: buffer) {
+                    if !skippingOversizedLine { parser.consume(Data(buffer[..<newline])) }
+                    buffer.removeSubrange(...newline); skippingOversizedLine = false
+                }
             }
             if buffer.count > 8 * 1024 * 1024 { buffer.removeAll(keepingCapacity: false); skippingOversizedLine = true }
         }
         // An unterminated last record may still be in flight; pick it up next refresh.
-        return parser.result
+        var result = parser.result
+        result.bytesRead = bytesRead
+        return result
+    }
+    /// Data's generic firstIndex performs storage lookups for every byte. Use the
+    /// platform's bounded byte search without decoding unrelated log content.
+    private static func newlineIndex(in data: Data) -> Data.Index? {
+        let start = data.startIndex
+        return data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress, let newline = memchr(base, 10, bytes.count) else { return nil }
+            return start + base.distance(to: UnsafeRawPointer(newline))
+        }
     }
     public static func parse(_ text: String, start: Date, end: Date) -> ScanResult {
         var parser = Parser(start: start, end: end)
@@ -64,6 +138,11 @@ public enum LogScanner {
         return parser.result
     }
     private struct Parser {
+        private static let markers = ["\"session_meta\"", "\"turn_context\"", "\"token_count\"", "\"token_usage_record\""].map { Data($0.utf8) }
+        private let fractionalDate: ISO8601DateFormatter = {
+            let f = ISO8601DateFormatter(); f.formatOptions.insert(.withFractionalSeconds); return f
+        }()
+        private let wholeDate = ISO8601DateFormatter()
         let start: Date
         let end: Date
         var model = "Unknown model"
@@ -77,8 +156,7 @@ public enum LogScanner {
         var malformed = 0
         var result: ScanResult { ScanResult(points: counts.isEmpty ? records : counts, malformedRecords: malformed) }
         mutating func consume(_ data: Data) {
-            guard let line = String(data: data, encoding: .utf8),
-                  ["\"session_meta\"", "\"turn_context\"", "\"token_count\"", "\"token_usage_record\""].contains(where: line.contains) else { return }
+            guard Self.markers.contains(where: { data.range(of: $0) != nil }) else { return }
             guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let type = root["type"] as? String, let p = root["payload"] as? [String: Any] else { malformed += 1; return }
             if type == "session_meta" {
@@ -96,7 +174,8 @@ public enum LogScanner {
                 if !turn.isEmpty { efforts[turn] = effort }
                 return
             }
-            guard let ts = root["timestamp"] as? String, let time = WireTime.date(ts) else { malformed += 1; return }
+            guard let ts = root["timestamp"] as? String,
+                  let time = fractionalDate.date(from: ts) ?? wholeDate.date(from: ts) else { malformed += 1; return }
             guard time >= start && time < end else { return }
             if type == "event_msg", p["type"] as? String == "token_count",
                let info = p["info"] as? [String: Any], let usage = info["last_token_usage"] as? [String: Any] {

@@ -24,6 +24,8 @@ public struct NetworkState: Codable, Sendable {
     public var combinedDay: Date?
     public var combined: Tokens?
     public var machines: [String: Tokens] = [:]
+    public var rows: [AggregateRow]?
+    public var machineRows: [String: [AggregateRow]]?
     public init() {}
 }
 public enum LocalStore {

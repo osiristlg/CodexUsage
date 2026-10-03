@@ -11,18 +11,34 @@ try ProtocolTests().testPublishedWindowsVector()
 try ProtocolTests().testNormalizationAndTimestamp()
 print("PASS: Windows golden vector, tampering, wrong key, version, NFKC and timestamp checks")
 try ScannerTests().run()
+try await cachedScannerChecks()
 try await networkChecks()
 print("PASS: scanner precedence, privacy, hour boundaries, local 2am scheduling, DST and retry identity")
 try ReceiverConfigurationTests().run()
 print("PASS: receiver settings schema, validation, registration and credential rotation")
 try PresentationTests().run()
-print("PASS: daily mixed and Unknown effort totals, day isolation and unchanged hourly grouping")
+print("PASS: daily/hourly efforts, rolling project/model totals and shares, remote cache and range isolation")
 
 if CommandLine.arguments.contains("--scan-local") {
     let now = Date()
     let start = Calendar.current.date(byAdding: .day, value: -29, to: Calendar.current.startOfDay(for: now))!
     let result = try LogScanner.scan(folder: LogScanner.defaultFolder, start: start, end: now)
     print("Local read-only scan: \(result.files) files, \(result.points.count) derived points, \(result.unreadableFiles) unreadable, \(result.malformedRecords) malformed")
+}
+if CommandLine.arguments.contains("--profile-local") {
+    let calendar = Calendar.current
+    let today = calendar.startOfDay(for: Date())
+    let start = calendar.date(byAdding: .day, value: -29, to: today)!
+    let end = calendar.date(byAdding: .day, value: 1, to: today)!
+    let scanner = CachedLogScanner()
+    let clock = ContinuousClock()
+    for label in ["cold", "warm", "warm"] {
+        let began = clock.now
+        let result = try await scanner.scan(folder: LogScanner.defaultFolder, start: start, end: end)
+        let elapsed = began.duration(to: clock.now)
+        let total = result.points.reduce(Int64(0)) { $0 + $1.tokens.total }
+        print("PROFILE \(label): \(elapsed), \(result.files) files, \(result.filesParsed) parsed, \(result.bytesRead) bytes read, \(result.points.count) points, \(total) tokens, \(result.unreadableFiles) unreadable, \(result.malformedRecords) malformed")
+    }
 }
 if CommandLine.arguments.contains("--keychain") {
     let account = "self-test-" + UUID().uuidString

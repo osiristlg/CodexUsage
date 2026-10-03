@@ -50,6 +50,8 @@ public struct SyncPayload: Codable, Sendable {
     public var rangeEndUtc: String
     public var combinedStartUtc: String
     public var combinedEndUtc: String
+    public var queryStartUtc: String? = nil
+    public var queryEndUtc: String? = nil
     public var rows: [AggregateRow]
     public init(kind: String, machineName: String, rangeStartUtc: String, rangeEndUtc: String,
                 combinedStartUtc: String, combinedEndUtc: String, rows: [AggregateRow]) {
@@ -64,6 +66,8 @@ public struct ExchangeReply: Codable, Sendable {
     public var receivedAtUtc: String
     public var combined: Tokens
     public var machines: [String: Tokens]
+    public var rows: [AggregateRow]? = nil
+    public var machineRows: [String: [AggregateRow]]? = nil
 }
 public struct Envelope: Codable, Sendable {
     public var version: Int

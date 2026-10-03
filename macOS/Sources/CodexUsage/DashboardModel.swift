@@ -3,11 +3,33 @@ import AppKit
 import UsageCore
 import UsagePresentation
 
+enum UsageSource: Hashable { case local, all, machine(String) }
+
 @MainActor final class DashboardModel: ObservableObject {
     let receiverHost = ReceiverHostModel()
     @Published var settings = LocalStore.load("mac-settings.json", as: UsageCore.Settings.self) ?? UsageCore.Settings()
     @Published var points: [UsagePoint] = []
-    private(set) var aggregates = DashboardAggregates([])
+    @Published var source = UsageSource.local
+    private let emptyAggregates = DashboardAggregates([])
+    private var localAggregates = DashboardAggregates([])
+    private var allAggregates = DashboardAggregates([])
+    private var machineAggregates: [String: DashboardAggregates] = [:]
+    var aggregates: DashboardAggregates {
+        switch source {
+        case .local: return localAggregates
+        case .all: return allAggregates
+        case .machine(let name): return machineAggregates[name] ?? emptyAggregates
+        }
+    }
+    var sourceLabel: String {
+        switch source { case .local: return "This Mac"; case .all: return "All machines"; case .machine(let name): return name }
+    }
+    var availableMachines: [String] { machineAggregates.keys.sorted() }
+    var hasRemoteHistory: Bool { network.rows != nil }
+    private func rebuildRemoteAggregates() {
+        allAggregates = DashboardAggregates(rows: network.rows ?? [])
+        machineAggregates = (network.machineRows ?? [:]).mapValues { DashboardAggregates(rows: $0) }
+    }
     @Published var network = NetworkState()
     @Published var busy = false
     @Published var status = "Ready"
@@ -17,7 +39,9 @@ import UsagePresentation
     @Published var hoveredDate: Date? = nil
     @Published var hoveredHour: Int? = nil
     @Published var filesScanned = 0
+    @Published var scanDiagnostics = ""
     private var lastSnapshot: Date?
+    private let scanner = CachedLogScanner()
     private var snapshotError: String?
     private var cachedCredential: (account: String, key: Data)?
     private var blockedCredentialAccount: String?
@@ -42,8 +66,9 @@ import UsagePresentation
             catch { status = "Could not save initial settings: \(error.localizedDescription)" }
         }
         points = LocalStore.load("mac-history.json", as: [UsagePoint].self) ?? []
-        aggregates = DashboardAggregates(points)
+        localAggregates = DashboardAggregates(points)
         network = LocalStore.load("mac-network-state.json", as: NetworkState.self) ?? NetworkState()
+        rebuildRemoteAggregates()
         networkStatus = settings.reportingEnabled ? "Waiting for refresh" : "Reporting disabled"
     }
     func setHover(day: Date?, hour: Int?) {
@@ -73,16 +98,20 @@ import UsagePresentation
         let start = cal.date(byAdding: .day, value: -29, to: cal.startOfDay(for: now))!
         let end = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now))!
         do {
-            let (scan, derived) = try await Task.detached(priority: .utility) {
-                let scan = try LogScanner.scan(folder: URL(fileURLWithPath: config.sessionsFolder), start: start, end: end)
-                return (scan, DashboardAggregates(scan.points, now: now, calendar: cal))
+            let scanner = scanner
+            let (scan, derived, elapsed) = try await Task.detached(priority: .utility) {
+                let clock = ContinuousClock(); let began = clock.now
+                let scan = try await scanner.scan(folder: URL(fileURLWithPath: config.sessionsFolder), start: start, end: end, force: force)
+                let elapsed = began.duration(to: clock.now)
+                return (scan, DashboardAggregates(scan.points, now: now, calendar: cal), elapsed)
             }.value
             guard scan.unreadableFiles == 0 else {
                 throw UsageError.invalid("\(scan.unreadableFiles) log files could not be read. Keeping previous totals; sync will retry.")
             }
-            aggregates = derived
+            localAggregates = derived
             points = scan.points
             filesScanned = scan.files
+            scanDiagnostics = "Scan: \(elapsed). Parsed \(scan.filesParsed) of \(scan.files) files; read \(ByteCountFormatter.string(fromByteCount: scan.bytesRead, countStyle: .file))."
             try LocalStore.save(points, name: "mac-history.json")
             lastRefresh = now
             status = "\(scan.files) sessions · \(scan.points.count) responses"
@@ -93,7 +122,13 @@ import UsagePresentation
                     let forceFull = network.needsFullSync == true
                     let next = try await SyncEngine.sync(settings: config, points: points, previous: network, key: key, force: forceFull)
                     try LocalStore.save(next, name: "mac-network-state.json")
+                    let remote = await Task.detached(priority: .utility) {
+                        (DashboardAggregates(rows: next.rows ?? []),
+                         (next.machineRows ?? [:]).mapValues { DashboardAggregates(rows: $0) })
+                    }.value
+                    allAggregates = remote.0; machineAggregates = remote.1
                     network = next
+                    if case .machine(let name) = source, machineAggregates[name] == nil { source = .local }
                     networkStatus = "Encrypted sync complete · " + Date().formatted(date: .omitted, time: .shortened)
                 } catch { networkStatus = "Sync failed: \(error.localizedDescription)" }
             } else { networkStatus = "Reporting disabled" }
@@ -121,10 +156,12 @@ import UsagePresentation
                 cachedCredential = nil; blockedCredentialAccount = nil
             }
             network = NetworkState(); network.needsFullSync = true
+            rebuildRemoteAggregates(); source = .local
             try LocalStore.save(network, name: "mac-network-state.json")
         }
         try LocalStore.save(draft, name: "mac-settings.json")
         settings = draft
+        if !draft.reportingEnabled { source = .local }
         networkStatus = draft.reportingEnabled ? "Waiting for refresh" : "Reporting disabled"
         Task { await refresh() }
     }

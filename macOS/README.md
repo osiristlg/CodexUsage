@@ -16,6 +16,8 @@ The script creates an ad-hoc signed app for local development. Distribution sign
 ## Dashboard
 
 - Today's local total, input, cached input, output and reasoning counts.
+- Select This Mac, All machines, or an individual reporting machine when reporting is enabled. Receiver history is cached after each successful sync.
+- The **30d** button in Usage by project opens ranked rolling 30-day project totals for the selected source, with exact input-plus-output totals, shares, and per-model hover breakdowns.
 - Cached reasoning-effort totals in hourly bar and rolling 30-day tooltips. Missing effort is shown as Unknown.
 - Force full upload in Network settings to refresh the receiver's last 30 days with the updated effort-aware aggregates.
 - A neon rolling 30-day line chart with floating date, total, and per-model tooltips. Click a day to pin or unpin its hourly and project views.
@@ -25,7 +27,7 @@ The script creates an ad-hoc signed app for local development. Distribution sign
 - The same Night City, Neon Sunset, Toxic Rain, Ion Storm, and Redline District palettes as the Windows dashboard.
 - Optional PNG snapshots every 5, 15, 30 or 60 minutes, with project names hidden by default. Export atomically replaces `codex-usage-latest.png`.
 
-Snapshots are generated on the next refresh after their interval elapses. Refresh and synchronization resume after sleep while the app is open; no launch agent or background service is installed. The app intentionally rescans the local logs on refresh for correctness, including older session files that receive new events. Large log collections may take longer.
+Snapshots are generated on the next refresh after their interval elapses. Refresh and synchronization resume after sleep while the app is open; no launch agent or background service is installed. The first scan reads all logs. Later refreshes reuse in-memory derived points for unchanged files and fully reparse changed files, including older sessions that receive new events. File replacement, truncation, deletion and calendar-window changes invalidate cached results. **Rebuild 30 days** forces a fresh scan. Hover the Updated label to see scan duration, files parsed and bytes read.
 
 ## Settings and privacy
 
@@ -61,10 +63,11 @@ The checks are a standalone Swift executable, so they also run on Command Line T
 ```sh
 swift run --package-path macOS UsageCoreChecks
 swift run --package-path macOS UsageCoreChecks --scan-local
+swift run --package-path macOS -c release UsageCoreChecks --profile-local
 swift run --package-path macOS UsageCoreChecks --keychain
 ```
 
-`--scan-local` reads the local sessions and prints only aggregate diagnostic counts. `--keychain` exercises a unique temporary credential and deletes it afterward. Run checks in debug mode (the default), where preconditions remain enabled.
+`--scan-local` reads the local sessions and prints only aggregate diagnostic counts. `--profile-local` measures one cold scan and two cached scans, printing timing, files parsed, bytes read and aggregate counts. `--keychain` exercises a unique temporary credential and deletes it afterward. Run correctness checks in debug mode (the default).
 
 Coverage includes the published Windows AES-GCM vector and PBKDF2 key, Swift JSON schema equivalence, NFKC normalization, .NET tick precision, wrong keys, tampered headers, unsupported versions, scanner format precedence, anonymous labels, hourly grouping, 2 a.m. scheduling, DST transitions, encrypted mocked replies and idempotent transport retry. No live receiver credentials are required.
 

@@ -77,9 +77,12 @@ public enum SyncEngine {
                             force: Bool = false, query: Bool = false, now: Date = Date(),
                             calendar: Calendar = .current, transport: any ExchangeTransport = HTTPTransport()) async throws -> NetworkState {
         let window = SyncWindow.make(now: now, lastFull: previous.lastFull, force: force || previous.needsFullSync == true, calendar: calendar)
-        let payload = NetworkClient.payload(settings: settings, points: points, window: window, key: key, query: query)
+        var payload = NetworkClient.payload(settings: settings, points: points, window: window, key: key, query: query)
+        payload.queryStartUtc = WireTime.string(calendar.date(byAdding: .day, value: -29, to: window.today)!)
+        payload.queryEndUtc = WireTime.string(window.tomorrow)
         let reply = try await NetworkClient.exchange(settings: settings, payload: payload, key: key, now: now, transport: transport)
         var next = previous
+        next.rows = reply.rows; next.machineRows = reply.machineRows
         next.lastSuccess = now; next.combinedDay = window.today; next.combined = reply.combined; next.machines = reply.machines
         if window.full && !query { next.lastFull = window.today; next.needsFullSync = false }
         return next

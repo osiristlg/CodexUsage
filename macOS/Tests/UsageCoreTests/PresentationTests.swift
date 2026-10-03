@@ -79,5 +79,31 @@ struct PresentationTests {
         let reconfigured = DashboardAggregates(points, now: day, calendar: changedCalendar)
         expectEqual(reconfigured.days, DashboardPresentation.days(points, now: day, calendar: changedCalendar))
         expectEqual(reconfigured.hours(day: day), DashboardPresentation.hours(points, day: day, calendar: changedCalendar))
+        let rows = [
+            AggregateRow(bucketStartUtc: WireTime.string(day), model: "A", project: "First", tokens: Tokens(input: 100, cachedInput: 90, output: 20, reasoning: 10, responses: 5)),
+            AggregateRow(bucketStartUtc: WireTime.string(day), model: "B", project: "First", tokens: Tokens(input: 40, output: 10, responses: 2)),
+            AggregateRow(bucketStartUtc: WireTime.string(day.addingTimeInterval(-29 * 86400)), model: "A", project: "Second", tokens: Tokens(input: 30, responses: 1)),
+            AggregateRow(bucketStartUtc: WireTime.string(day.addingTimeInterval(-30 * 86400)), model: "A", project: "Outside", tokens: Tokens(input: 999)),
+            AggregateRow(bucketStartUtc: WireTime.string(day.addingTimeInterval(86400)), model: "A", project: "Future", tokens: Tokens(input: 999))
+        ]
+        let remote = DashboardAggregates(rows: rows, now: day, calendar: calendar)
+        expectEqual(remote.rollingProjects.map(\.name), ["First", "Second"])
+        expectEqual(remote.rollingProjects.map(\.total), [170, 30])
+        expectEqual(remote.rollingProjects[0].models, ["A": 120, "B": 50])
+        expectEqual(remote.rollingProjects[0].share, 0.85)
+        expectEqual(remote.rollingProjects[1].share, 0.15)
+        expectEqual(remote.responseCount(day: day), 7)
+        expectEqual(remote.tokens(day: day).total, 170)
+        let localEquivalent = DashboardAggregates(UsagePoint.fromAggregates(rows), now: day, calendar: calendar)
+        expectEqual(remote.rollingProjects, localEquivalent.rollingProjects)
+        expectEqual(DashboardAggregates(rows: [], now: day, calendar: calendar).rollingProjects, [])
+        let tied = DashboardAggregates([UsagePoint(time: day, model: "A", project: "Z", tokens: Tokens(input: 10)),
+                                       UsagePoint(time: day, model: "A", project: "A", tokens: Tokens(input: 10))], now: day, calendar: calendar)
+        expectEqual(tied.rollingProjects.map(\.name), ["A", "Z"])
+        var persisted = NetworkState()
+        persisted.rows = rows; persisted.machineRows = ["Example": rows]
+        let decoded = try JSONDecoder().decode(NetworkState.self, from: JSONEncoder().encode(persisted))
+        expectEqual(decoded.rows, rows)
+        expectEqual(decoded.machineRows?["Example"], rows)
     }
 }

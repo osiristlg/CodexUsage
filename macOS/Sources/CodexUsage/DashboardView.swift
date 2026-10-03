@@ -75,6 +75,7 @@ struct DashboardView: View {
             }
         }
         .frame(minWidth: 920, minHeight: 700)
+        .onChange(of: model.source) { _, _ in model.setHover(day: nil, hour: nil) }
         .sheet(isPresented: $showSettings) { SettingsView(model: model) }
     }
 
@@ -82,9 +83,17 @@ struct DashboardView: View {
         HStack(spacing: 10) {
             Text("CODEX  /  USAGE").font(.system(size: 15, weight: .semibold, design: .rounded)).tracking(1.2)
             Spacer()
+            if model.settings.reportingEnabled {
+                Picker("Usage source", selection: $model.source) {
+                    Text("This Mac").tag(UsageSource.local)
+                    if model.hasRemoteHistory { Text("All machines").tag(UsageSource.all) }
+                    ForEach(model.availableMachines, id: \.self) { Text($0).tag(UsageSource.machine($0)) }
+                }.labelsHidden().frame(maxWidth: 180)
+            }
             if model.busy { ProgressView().controlSize(.small).tint(theme.primary) }
             Text(model.lastRefresh.map { "Updated \($0.formatted(date: .omitted, time: .shortened))  ·  every \(refreshLabel)" } ?? model.status)
                 .font(.system(size: 11)).foregroundStyle(theme.muted).lineLimit(1).frame(maxWidth: 220, alignment: .trailing)
+                .help(model.scanDiagnostics)
             Button("↻  Refresh now") { Task { await model.refresh() } }
                 .buttonStyle(NeonButtonStyle(accent: theme.primary)).disabled(model.busy)
             Button("◷  Rebuild 30 days") { Task { await model.refresh(force: true) } }
@@ -117,7 +126,8 @@ private struct HeroPanel: View {
                             .font(.system(size: 11, weight: .semibold)).tracking(0.7).foregroundStyle(theme.tertiary)
                             .help(model.network.machines.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value.total.formatted())" }.joined(separator: "\n"))
                     }
-                    Text("\(model.aggregates.responseCount(day: Date()).formatted()) responses across \(model.filesScanned.formatted()) log files")
+                    Text("\(model.aggregates.responseCount(day: Date()).formatted()) responses" +
+                         (model.source == .local ? " across \(model.filesScanned.formatted()) log files" : " · \(model.sourceLabel)"))
                         .font(.system(size: 11, weight: .medium)).foregroundStyle(theme.muted).lineLimit(1)
                 }
                 .frame(width: max(270, geometry.size.width * 0.27), alignment: .leading)
@@ -264,6 +274,7 @@ private struct HourlyChart: View {
 }
 
 private struct ProjectPanel: View {
+    @Environment(\.openWindow) private var openWindow
     @ObservedObject var model: DashboardModel
     @Environment(\.dashboardTheme) private var theme
     private var values: [ProjectValue] {
@@ -272,18 +283,26 @@ private struct ProjectPanel: View {
     private var effectiveDay: Date { model.hoveredDate ?? model.selectedDate ?? Date() }
     private var scope: String {
         if let hour = model.hoveredHour { return "\(effectiveDay.formatted(.dateTime.month(.abbreviated).day())) · \(hourRange(hour))".uppercased() }
-        return Calendar.current.isDateInToday(effectiveDay) ? "TODAY" : effectiveDay.formatted(.dateTime.month(.abbreviated).day()).uppercased()
+        return Calendar.current.isDateInToday(effectiveDay) ? "" : effectiveDay.formatted(.dateTime.month(.abbreviated).day()).uppercased()
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Usage by project").font(.system(size: 15, weight: .semibold))
-                Spacer(); Text(scope).font(.system(size: 9, weight: .semibold)).tracking(0.5).foregroundStyle(theme.tertiary)
+                Spacer()
+                Button("30d") { openWindow(id: "project-totals") }
+                    .buttonStyle(.plain).font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(theme.panel, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(theme.tertiary.opacity(0.7)))
+                    .help("Rolling 30-day project totals")
+                Text(scope).font(.system(size: 9, weight: .semibold)).tracking(0.5).foregroundStyle(theme.tertiary)
             }
             if values.isEmpty {
                 Spacer(); Text("No project usage for this selection").font(.system(size: 12)).foregroundStyle(theme.muted).frame(maxWidth: .infinity); Spacer()
             } else {
-                VStack(spacing: 12) {
+                ScrollView {
+                  VStack(spacing: 12) {
                     ForEach(Array(values.enumerated()), id: \.element.id) { index, value in
                         VStack(spacing: 7) {
                             HStack { Text(value.name).lineLimit(1); Spacer(); Text(count(value.total)).foregroundStyle(theme.muted).monospacedDigit() }
@@ -296,8 +315,8 @@ private struct ProjectPanel: View {
                             }.frame(height: 7)
                         }
                     }
-                }
-                Spacer(minLength: 0)
+                  }.padding(.vertical, 4)
+                }.scrollIndicators(.hidden)
             }
         }.padding(24).foregroundStyle(theme.text).neonPanel(theme.tertiary)
     }

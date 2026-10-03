@@ -76,6 +76,61 @@ private struct FixturePoint: Codable {
     let project: String
     let tokens: Tokens
 }
+
+func cachedScannerChecks() async throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("session.jsonl")
+    let start = WireTime.date("2026-09-10T00:00:00Z")!
+    let end = start.addingTimeInterval(86400)
+    let scanner = CachedLogScanner()
+    let metadata = #"{"type":"session_meta","payload":{"cwd":"/Example"}}"# + "\n"
+    let legacy = #"{"timestamp":"2026-09-10T12:15:00Z","type":"token_usage_record","payload":{"usage":{"input_tokens":10}}}"#
+    let event = #"{"timestamp":"2026-09-10T12:15:00.123Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20}}}}"#
+    try Data((metadata + legacy + "\n").utf8).write(to: file)
+    let cold = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(cold.filesParsed, 1); expectEqual(cold.points.first?.tokens.total, 10)
+    let warm = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(warm.filesParsed, 0); expectEqual(warm.bytesRead, 0)
+    expectEqual(warm.points.first?.tokens.total, 10)
+    // Appends to old sessions must be picked up, and token_count must displace legacy records.
+    let handle = try FileHandle(forWritingTo: file)
+    try handle.seekToEnd(); try handle.write(contentsOf: Data(event.utf8)); try handle.close()
+    let partial = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(partial.points.first?.tokens.total, 10)
+    let finish = try FileHandle(forWritingTo: file)
+    try finish.seekToEnd(); try finish.write(contentsOf: Data("\n".utf8)); try finish.close()
+    let appended = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(appended.filesParsed, 1); expectEqual(appended.points.count, 1)
+    expectEqual(appended.points.first?.tokens.total, 20)
+    let full = try LogScanner.scan(folder: folder, start: start, end: end)
+    let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+    expectEqual(try encoder.encode(appended.points), try encoder.encode(full.points))
+    let forced = try await scanner.scan(folder: folder, start: start, end: end, force: true)
+    expectEqual(forced.filesParsed, 1)
+    // Same-length replacement with a new inode, truncation, removal and a new day.
+    try Data((metadata + event.replacingOccurrences(of: ":20", with: ":30") + "\n").utf8).write(to: file, options: .atomic)
+    let rewritten = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(rewritten.points.first?.tokens.total, 30)
+    let next = try await scanner.scan(folder: folder, start: end, end: end.addingTimeInterval(86400))
+    expectEqual(next.points.count, 0); expectEqual(next.filesParsed, 1)
+    try Data(metadata.utf8).write(to: file)
+    let truncated = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(truncated.points.count, 0)
+    try FileManager.default.removeItem(at: file)
+    let deleted = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(deleted.files, 0); expectEqual(deleted.points.count, 0)
+    // Cross the read-buffer boundary and discard an oversized unrelated line.
+    let padding = String(repeating: "x", count: 65_530) + "\n"
+    let oversized = String(repeating: "y", count: 8 * 1024 * 1024 + 65_536) + "\n"
+    try Data((metadata + padding + event + "\r\n" + oversized + event + "\n").utf8).write(to: file)
+    let chunked = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(chunked.points.count, 2)
+    expectEqual(chunked.points.reduce(Int64(0)) { $0 + $1.tokens.total }, 40)
+    expectEqual(LogScanner.parse("{\"type\":\"event_msg\",\"payload\":{\"type\":\"other\",\"text\":\"héllo 🌍\"}}", start: start, end: end).malformedRecords, 0)
+    print("PASS: cached scanner append, partial line, precedence, rewrite, truncation, deletion, day change, forced rebuild and buffer boundaries")
+}
 actor MockReceiver: ExchangeTransport {
     let key = Data(repeating: 1, count: 32)
     var attempts = 0
@@ -89,10 +144,16 @@ actor MockReceiver: ExchangeTransport {
         let envelope = try JSONDecoder().decode(Envelope.self, from: request.httpBody!)
         let payload = try JSONDecoder().decode(SyncPayload.self, from: AggregateProtocol.open(envelope, key: key))
         expectEqual(payload.kind, "full")
+        expectEqual(payload.queryEndUtc, payload.combinedEndUtc)
+        let queryStart = WireTime.date(payload.queryStartUtc!)!
+        let combinedStart = WireTime.date(payload.combinedStartUtc)!
+        expectEqual(Calendar.current.dateComponents([.day], from: queryStart, to: combinedStart).day, 29)
         expectEqual(payload.rows.allSatisfy { $0.project.hasPrefix("Project ") }, true)
         if reject { throw UsageError.invalid("Test failure") }
         let reply = try JSONSerialization.data(withJSONObject: ["accepted": true, "message": "Accepted", "receivedAtUtc": WireTime.string(Date()),
-            "combined": ["input": 100, "cachedInput": 80, "output": 20, "reasoning": 5, "responses": 1], "machines": [:]])
+            "combined": ["input": 100, "cachedInput": 80, "output": 20, "reasoning": 5, "responses": 1], "machines": [:],
+            "rows": [["bucketStartUtc": payload.combinedStartUtc, "model": "Example", "project": "Project", "tokens": ["input": 100, "cachedInput": 80, "output": 20, "reasoning": 5, "responses": 1]]],
+            "machineRows": ["Example Mac": [["bucketStartUtc": payload.combinedStartUtc, "model": "Example", "project": "Project", "tokens": ["input": 100, "cachedInput": 80, "output": 20, "reasoning": 5, "responses": 1]]]]])
         return try JSONEncoder().encode(AggregateProtocol.seal(reply, clientId: envelope.clientId,
             requestId: UUID().uuidString, createdAtUtc: WireTime.string(Date()), key: key))
     }
@@ -106,6 +167,8 @@ func networkChecks() async throws {
     let result = try await SyncEngine.sync(settings: Settings(), points: [], previous: initial,
         key: Data(repeating: 1, count: 32), force: true, transport: receiver)
     expectEqual(result.combined?.total, 120)
+    expectEqual(result.rows?.first?.tokens.total, 120)
+    expectEqual(result.machineRows?["Example Mac"]?.first?.project, "Project")
     expectEqual(result.lastFull != nil, true)
     expectEqual(result.needsFullSync, false)
     await receiver.setReject()
