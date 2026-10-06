@@ -169,85 +169,88 @@ internal static class LogScanner
 
     private static void ScanFile(string file, DateTime firstDay, DateTime lastDay, List<UsagePoint> points, CancellationToken token)
     {
-        var modelByTurn = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var effortByTurn = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        string fallbackModel = "Unknown model";
-        string currentModel = fallbackModel;
-        string currentEffort = "Unknown";
-        string currentProject = "Projectless";
-        var countPoints = new List<UsagePoint>();
-        var recordPoints = new List<UsagePoint>();
+        lock (fileCache)
+        {
+            var retainFrom = firstDay.Date < DateTime.Today.AddDays(-29) ? firstDay.Date : DateTime.Today.AddDays(-29);
+            if (!fileCache.TryGetValue(file, out var cached) || retainFrom < cached.State.RetainFrom)
+            {
+                cached = new(() => new FileUsageState { RetainFrom = retainFrom }, ParseCachedLine);
+                fileCache[file] = cached;
+            }
+            cached.State.RetainFrom = retainFrom;
+            cached.State.CountPoints.RemoveAll(p => p.Time.Date < retainFrom);
+            cached.State.RecordPoints.RemoveAll(p => p.Time.Date < retainFrom);
+            try { cached.Update(file, token); }
+            catch (IOException) { /* Preserve already parsed data during a transient write. */ }
+            var counts = cached.State.CountPoints.Where(p => p.Time.Date >= firstDay.Date && p.Time.Date <= lastDay.Date).ToArray();
+            points.AddRange(counts.Length > 0 ? counts : cached.State.RecordPoints
+                .Where(p => p.Time.Date >= firstDay.Date && p.Time.Date <= lastDay.Date));
+        }
+    }
+
+    private static readonly Dictionary<string, IncrementalJsonlFile<FileUsageState>> fileCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class FileUsageState
+    {
+        public DateTime RetainFrom;
+        public Dictionary<string, string> Models { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> Efforts { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public string FallbackModel = "Unknown model", CurrentModel = "Unknown model", Effort = "Unknown", Project = "Projectless";
+        public List<UsagePoint> CountPoints { get; } = [];
+        public List<UsagePoint> RecordPoints { get; } = [];
+    }
+
+    private static void ParseCachedLine(FileUsageState state, string line)
+    {
+        if (!line.Contains("\"turn_context\"", StringComparison.Ordinal) &&
+            !line.Contains("\"token_count\"", StringComparison.Ordinal) &&
+            !line.Contains("\"token_usage_record\"", StringComparison.Ordinal) &&
+            !line.Contains("\"session_meta\"", StringComparison.Ordinal)) return;
         try
         {
-            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.SequentialScan);
-            using var reader = new StreamReader(stream);
-            string? line;
-            while ((line = reader.ReadLine()) is not null)
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            var type = root.GetProperty("type").GetString();
+            var payload = root.GetProperty("payload");
+            if (type == "session_meta")
             {
-                token.ThrowIfCancellationRequested();
-                if (!line.Contains("\"turn_context\"", StringComparison.Ordinal) &&
-                    !line.Contains("\"token_count\"", StringComparison.Ordinal) &&
-                    !line.Contains("\"token_usage_record\"", StringComparison.Ordinal) &&
-                    !line.Contains("\"session_meta\"", StringComparison.Ordinal)) continue;
-                try
-                {
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement;
-                    var type = root.GetProperty("type").GetString();
-                    var payload = root.GetProperty("payload");
-
-                    if (type == "session_meta")
-                    {
-                        if (payload.TryGetProperty("cwd", out var cwd))
-                            currentProject = FriendlyProject(cwd.GetString());
-                        if (payload.TryGetProperty("base_instructions", out var bi) &&
-                            bi.TryGetProperty("provenance", out var prov) &&
-                            prov.TryGetProperty("model", out var sm))
-                            currentModel = fallbackModel = FriendlyModel(sm.GetString());
-                        continue;
-                    }
-                    if (type == "turn_context")
-                    {
-                        var contextTurnId = payload.TryGetProperty("turn_id", out var tid) ? tid.GetString() ?? "" : "";
-                        if (payload.TryGetProperty("model", out var model))
-                        {
-                            currentModel = FriendlyModel(model.GetString());
-                            if (contextTurnId.Length > 0) modelByTurn[contextTurnId] = currentModel;
-                        }
-                        currentEffort = FriendlyEffort(ReadEffort(payload));
-                        if (contextTurnId.Length > 0) effortByTurn[contextTurnId] = currentEffort;
-                        continue;
-                    }
-
-                    var utc = DateTime.Parse(root.GetProperty("timestamp").GetString()!, CultureInfo.InvariantCulture,
-                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
-                    var local = utc.ToLocalTime();
-                    if (local.Date < firstDay.Date || local.Date > lastDay.Date) continue;
-
-                    if (type == "event_msg" && payload.TryGetProperty("type", out var eventType) &&
-                        eventType.GetString() == "token_count" && payload.TryGetProperty("info", out var info) &&
-                        info.ValueKind == JsonValueKind.Object &&
-                        info.TryGetProperty("last_token_usage", out var lastUsage) &&
-                        lastUsage.ValueKind == JsonValueKind.Object)
-                    {
-                        countPoints.Add(ToPoint(local, currentModel, currentProject, currentEffort, lastUsage));
-                        continue;
-                    }
-                    if (type != "token_usage_record") continue;
-
-                    var turnId = payload.TryGetProperty("turn_id", out var tr) ? tr.GetString() ?? "" : "";
-                    var modelName = modelByTurn.GetValueOrDefault(turnId, fallbackModel);
-                    var effortName = effortByTurn.GetValueOrDefault(turnId, "Unknown");
-                    var usage = payload.GetProperty("usage");
-                    recordPoints.Add(ToPoint(local, modelName, currentProject, effortName, usage));
-                }
-                catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or KeyNotFoundException)
-                { /* Skip incomplete or legacy-shaped records without interrupting a refresh. */ }
+                if (payload.TryGetProperty("cwd", out var cwd)) state.Project = FriendlyProject(cwd.GetString());
+                if (payload.TryGetProperty("base_instructions", out var bi) &&
+                    bi.TryGetProperty("provenance", out var prov) && prov.TryGetProperty("model", out var sm))
+                    state.CurrentModel = state.FallbackModel = FriendlyModel(sm.GetString());
+                return;
             }
+            if (type == "turn_context")
+            {
+                var id = payload.TryGetProperty("turn_id", out var tid) ? tid.GetString() ?? "" : "";
+                if (payload.TryGetProperty("model", out var model))
+                {
+                    state.CurrentModel = FriendlyModel(model.GetString());
+                    if (id.Length > 0) state.Models[id] = state.CurrentModel;
+                }
+                state.Effort = FriendlyEffort(ReadEffort(payload));
+                if (id.Length > 0) state.Efforts[id] = state.Effort;
+                return;
+            }
+            var utc = DateTime.Parse(root.GetProperty("timestamp").GetString()!, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+            var local = utc.ToLocalTime();
+            if (local.Date < state.RetainFrom) return;
+            if (type == "event_msg" && payload.TryGetProperty("type", out var eventType) &&
+                eventType.GetString() == "token_count" && payload.TryGetProperty("info", out var info) &&
+                info.ValueKind == JsonValueKind.Object && info.TryGetProperty("last_token_usage", out var lastUsage) &&
+                lastUsage.ValueKind == JsonValueKind.Object)
+            {
+                state.CountPoints.Add(ToPoint(local, state.CurrentModel, state.Project, state.Effort, lastUsage));
+                return;
+            }
+            if (type != "token_usage_record") return;
+            var turnId = payload.TryGetProperty("turn_id", out var tr) ? tr.GetString() ?? "" : "";
+            state.RecordPoints.Add(ToPoint(local, state.Models.GetValueOrDefault(turnId, state.FallbackModel),
+                state.Project, state.Efforts.GetValueOrDefault(turnId, "Unknown"), payload.GetProperty("usage")));
         }
-        catch (IOException) { /* Skip a file briefly unavailable during a write. */ }
-        points.AddRange(countPoints.Count > 0 ? countPoints : recordPoints);
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException or KeyNotFoundException)
+        { /* Ignore malformed complete lines; unfinished lines aren't committed by the reader. */ }
     }
 
     private static UsagePoint ToPoint(DateTime time, string model, string project, string effort, JsonElement usage) => new(
@@ -890,8 +893,7 @@ internal sealed class DashboardForm : Form
     private void ExportSnapshot()
     {
         if (!appSettings.SnapshotEnabled || string.IsNullOrWhiteSpace(appSettings.SnapshotFolder) ||
-            canvas.Snapshot is null || canvas.Snapshot.Day.Date != DateTime.Today ||
-            WindowState == FormWindowState.Minimized || canvas.ClientSize.Width <= 0 || canvas.ClientSize.Height <= 0) return;
+            canvas.Snapshot is null || canvas.Snapshot.Day.Date != DateTime.Today) return;
         string? temporaryPath = null;
         try
         {
@@ -1885,6 +1887,7 @@ internal sealed class DashboardForm : Form
     {
         private readonly Button projectTotals = MakeButton("30d", 58, Theme.Tertiary);
         private readonly ToolTip projectTotalsTip = new() { ShowAlways = true };
+        private Size lastDashboardSize = new(1100, 760);
         public event EventHandler? ProjectTotalsRequested;
         private static Color[] Palette => Theme.Series;
         private Rectangle historyHitArea;
@@ -1924,6 +1927,8 @@ internal sealed class DashboardForm : Form
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
+            if (FindForm()?.WindowState != FormWindowState.Minimized && ClientSize.Width >= 600 && ClientSize.Height >= 500)
+                lastDashboardSize = ClientSize;
             var margin = Math.Max(28, Width / 35);
             projectTotals.Location = new Point(Width - margin - projectTotals.Width - 12, 244);
         }
@@ -1997,22 +2002,26 @@ internal sealed class DashboardForm : Form
         {
             base.OnPaint(e);
             if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
-            Render(e.Graphics, false);
+            Render(e.Graphics, false, ClientSize);
         }
 
         public void ExportPng(string path, bool hideProjectNames)
         {
-            using var bitmap = new Bitmap(Math.Max(1, Width), Math.Max(1, Height), PixelFormat.Format32bppPArgb);
+            using var bitmap = new Bitmap(lastDashboardSize.Width, lastDashboardSize.Height, PixelFormat.Format32bppPArgb);
             using var graphics = Graphics.FromImage(bitmap);
             var savedHoveredDate = hoveredDate;
             var savedHoveredHour = hoveredHour;
             var savedPinnedDate = pinnedDate;
+            var savedHistoryHitArea = historyHitArea;
+            var savedHistoryDays = historyDays;
+            var savedHourlyHitArea = hourlyHitArea;
+            var savedHourlyTotals = hourlyTotals;
             try
             {
                 hoveredDate = null;
                 hoveredHour = null;
                 pinnedDate = null;
-                Render(graphics, hideProjectNames);
+                Render(graphics, hideProjectNames, lastDashboardSize, exporting: true);
                 bitmap.Save(path, ImageFormat.Png);
             }
             finally
@@ -2020,25 +2029,35 @@ internal sealed class DashboardForm : Form
                 hoveredDate = savedHoveredDate;
                 hoveredHour = savedHoveredHour;
                 pinnedDate = savedPinnedDate;
+                historyHitArea = savedHistoryHitArea;
+                historyDays = savedHistoryDays;
+                hourlyHitArea = savedHourlyHitArea;
+                hourlyTotals = savedHourlyTotals;
             }
         }
 
-        private void Render(Graphics g, bool hideProjectNames)
+        private void Render(Graphics g, bool hideProjectNames, Size renderSize, bool exporting = false)
         {
-            if (ClientSize.Width <= 0 || ClientSize.Height <= 0) return;
+            if (renderSize.Width <= 0 || renderSize.Height <= 0) return;
+            var width = renderSize.Width;
+            var height = renderSize.Height;
+            var bounds = new Rectangle(Point.Empty, renderSize);
             DashboardDrawing.Configure(g);
-            using (var background = new LinearGradientBrush(ClientRectangle,
+            using (var background = new LinearGradientBrush(bounds,
                 Lighten(Bg, 3), Darken(Bg, 4), 35f))
-                g.FillRectangle(background, ClientRectangle);
+                g.FillRectangle(background, bounds);
             DrawAmbientLights(g);
-            ((NeonButton)projectTotals).SurroundColor = Panel;
-            projectTotals.Visible = Snapshot is not null;
+            if (!exporting)
+            {
+                ((NeonButton)projectTotals).SurroundColor = Panel;
+                projectTotals.Visible = Snapshot is not null;
+            }
             if (Snapshot is null) { DrawCentered(g, "Reading today’s usage…"); return; }
 
-            var margin = Math.Max(28, Width / 35);
-            var hero = new Rectangle(margin, 16, Width - margin * 2, 195);
-            var chartHeight = Math.Max(220, (Height - 277) / 2);
-            var contentWidth = Width - margin * 2;
+            var margin = Math.Max(28, width / 35);
+            var hero = new Rectangle(margin, 16, width - margin * 2, 195);
+            var chartHeight = Math.Max(220, (height - 277) / 2);
+            var contentWidth = width - margin * 2;
             var hourlyWidth = (int)((contentWidth - 19) * .66f);
             var chart = new Rectangle(margin, 230, hourlyWidth, chartHeight);
             var projects = new Rectangle(chart.Right + 19, 230, contentWidth - hourlyWidth - 19, chartHeight);
