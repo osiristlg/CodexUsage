@@ -103,6 +103,7 @@ func cachedScannerChecks() async throws {
     try finish.seekToEnd(); try finish.write(contentsOf: Data("\n".utf8)); try finish.close()
     let appended = try await scanner.scan(folder: folder, start: start, end: end)
     expectEqual(appended.filesParsed, 1); expectEqual(appended.points.count, 1)
+    expectEqual(appended.filesResumed, 1)
     expectEqual(appended.points.first?.tokens.total, 20)
     let full = try LogScanner.scan(folder: folder, start: start, end: end)
     let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
@@ -128,8 +129,29 @@ func cachedScannerChecks() async throws {
     let chunked = try await scanner.scan(folder: folder, start: start, end: end)
     expectEqual(chunked.points.count, 2)
     expectEqual(chunked.points.reduce(Int64(0)) { $0 + $1.tokens.total }, 40)
+    // A large session keeps context across tail reads without rereading the body.
+    let context = #"{"type":"turn_context","payload":{"turn_id":"tail","model":"gpt-6.1-sol","reasoning_effort":"high"}}"# + "\n"
+    try Data((metadata + context + String(repeating: padding, count: 200) + legacy + "\n").utf8).write(to: file, options: .atomic)
+    _ = try await scanner.scan(folder: folder, start: start, end: end)
+    let appendHandle = try FileHandle(forWritingTo: file)
+    try appendHandle.seekToEnd(); try appendHandle.write(contentsOf: Data((event + "\n").utf8)); try appendHandle.close()
+    let tail = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(tail.filesResumed, 1)
+    expectEqual(tail.bytesRead < 20_000, true)
+    expectEqual(tail.points.first?.model, "GPT 6.1-sol")
+    expectEqual(tail.points.first?.effort, "High")
+    expectEqual(tail.points.first?.project, "Example")
+    let tailFull = try LogScanner.scan(folder: folder, start: start, end: end)
+    expectEqual(try encoder.encode(tail.points), try encoder.encode(tailFull.points))
+    // Growing in-place edits to the checked prefix must invalidate tail parsing.
+    let rewriteHandle = try FileHandle(forWritingTo: file)
+    try rewriteHandle.seek(toOffset: 0)
+    try rewriteHandle.write(contentsOf: Data(metadata.replacingOccurrences(of: "Example", with: "Changed").utf8))
+    try rewriteHandle.seekToEnd(); try rewriteHandle.write(contentsOf: Data((event + "\n").utf8)); try rewriteHandle.close()
+    let prefixEdit = try await scanner.scan(folder: folder, start: start, end: end)
+    expectEqual(prefixEdit.filesResumed, 0); expectEqual(prefixEdit.points.first?.project, "Changed")
     expectEqual(LogScanner.parse("{\"type\":\"event_msg\",\"payload\":{\"type\":\"other\",\"text\":\"héllo 🌍\"}}", start: start, end: end).malformedRecords, 0)
-    print("PASS: cached scanner append, partial line, precedence, rewrite, truncation, deletion, day change, forced rebuild and buffer boundaries")
+    print("PASS: cached scanner/tail parity, context, bounded reads, partial line, precedence, rewrite, truncation, deletion, day change, forced rebuild and buffer boundaries")
 }
 actor MockReceiver: ExchangeTransport {
     let key = Data(repeating: 1, count: 32)

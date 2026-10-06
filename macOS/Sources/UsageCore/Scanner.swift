@@ -25,9 +25,9 @@ public struct ScanResult: Sendable {
     public var malformedRecords = 0
     public var filesParsed = 0
     public var bytesRead: Int64 = 0
+    public var filesResumed = 0
 }
-/// Keeps only derived usage and file metadata in memory. Changed files are reparsed
-/// in full, so rewrites, truncation and token-format precedence remain correct.
+/// Keeps derived usage and parser context, never raw log bodies.
 public actor CachedLogScanner {
     private var entries: [String: LogScanner.FileCache] = [:]
     public init() {}
@@ -55,6 +55,11 @@ public enum LogScanner {
         let start: Date
         let end: Date
         let result: ScanResult
+        let parser: Parser
+        let offset: UInt64
+        let skippingOversizedLine: Bool
+        let head: Data
+        let boundary: Data
     }
     public static var defaultFolder: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions") }
     public static func scan(folder: URL, start: Date, end: Date) throws -> ScanResult {
@@ -85,11 +90,23 @@ public enum LogScanner {
                     result.malformedRecords += entry.result.malformedRecords
                     continue
                 }
-                let parsed = try parseFile(file, start: start, end: end)
-                result.points += parsed.points; result.malformedRecords += parsed.malformedRecords
-                result.filesParsed += 1; result.bytesRead += parsed.bytesRead
-                if try FileStamp(file) == stamp {
-                    cache[file.path] = FileCache(stamp: stamp, start: start, end: end, result: parsed)
+                var resume: FileCache?
+                var validationBytes: Int64 = 0
+                if let entry = cache[file.path], entry.start == start, entry.end == end,
+                   entry.stamp.inode == stamp.inode, entry.stamp.created == stamp.created,
+                   stamp.size > entry.stamp.size {
+                    let check = try checkpoints(file, size: entry.stamp.size)
+                    validationBytes = Int64(check.0.count + check.1.count)
+                    if Data(SHA256.hash(data: check.0)) == entry.head && Data(SHA256.hash(data: check.1)) == entry.boundary { resume = entry }
+                }
+                let parsed = try parseFile(file, stamp: stamp, start: start, end: end, resume: resume)
+                result.points += parsed.result.points; result.malformedRecords += parsed.result.malformedRecords
+                result.filesParsed += 1; result.bytesRead += parsed.result.bytesRead + validationBytes
+                if resume != nil { result.filesResumed += 1 }
+                let after = try FileStamp(file)
+                if after.inode == stamp.inode, after.created == stamp.created,
+                   after.size > stamp.size || after == stamp {
+                    cache[file.path] = parsed
                 } else { cache.removeValue(forKey: file.path) }
             } catch is CancellationError { throw CancellationError() }
             catch { cache.removeValue(forKey: file.path); result.unreadableFiles += 1 }
@@ -99,29 +116,51 @@ public enum LogScanner {
         return result
     }
     // Stream by line, retaining only derived points, never a complete log in memory or cache.
-    private static func parseFile(_ file: URL, start: Date, end: Date) throws -> ScanResult {
+    private static func checkpoints(_ file: URL, size: Int64) throws -> (Data, Data) {
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        var parser = Parser(start: start, end: end)
+        let length = Int(min(4096, max(0, size)))
+        let head = try handle.read(upToCount: length) ?? Data()
+        try handle.seek(toOffset: UInt64(max(0, size - Int64(length))))
+        return (head, try handle.read(upToCount: length) ?? Data())
+    }
+    private static func parseFile(_ file: URL, stamp: FileStamp, start: Date, end: Date, resume: FileCache?) throws -> FileCache {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        var parser = resume?.parser ?? Parser(start: start, end: end)
         var buffer = Data()
-        var skippingOversizedLine = false
+        var skippingOversizedLine = resume?.skippingOversizedLine ?? false
         var bytesRead: Int64 = 0
-        while let chunk = try handle.read(upToCount: 65_536), !chunk.isEmpty {
+        var offset = resume?.offset ?? 0
+        var position = offset
+        try handle.seek(toOffset: offset)
+        // Read a bounded snapshot, so continuously appended sessions can still be cached.
+        while position < UInt64(stamp.size),
+              let chunk = try handle.read(upToCount: Int(min(65_536, UInt64(stamp.size) - position))), !chunk.isEmpty {
             bytesRead += Int64(chunk.count)
+            position += UInt64(chunk.count)
             try Task.checkCancellation()
             buffer.append(chunk)
             autoreleasepool {
                 while let newline = newlineIndex(in: buffer) {
                     if !skippingOversizedLine { parser.consume(Data(buffer[..<newline])) }
+                    offset += UInt64(newline - buffer.startIndex + 1)
                     buffer.removeSubrange(...newline); skippingOversizedLine = false
                 }
             }
-            if buffer.count > 8 * 1024 * 1024 { buffer.removeAll(keepingCapacity: false); skippingOversizedLine = true }
+            if buffer.count > 8 * 1024 * 1024 {
+                offset += UInt64(buffer.count)
+                buffer.removeAll(keepingCapacity: false); skippingOversizedLine = true
+            }
         }
         // An unterminated last record may still be in flight; pick it up next refresh.
         var result = parser.result
         result.bytesRead = bytesRead
-        return result
+        let check = try checkpoints(file, size: stamp.size)
+        result.bytesRead += Int64(check.0.count + check.1.count)
+        return FileCache(stamp: stamp, start: start, end: end, result: result, parser: parser,
+                         offset: offset, skippingOversizedLine: skippingOversizedLine,
+                         head: Data(SHA256.hash(data: check.0)), boundary: Data(SHA256.hash(data: check.1)))
     }
     /// Data's generic firstIndex performs storage lookups for every byte. Use the
     /// platform's bounded byte search without decoding unrelated log content.
@@ -137,7 +176,7 @@ public enum LogScanner {
         for line in text.split(separator: "\n") { parser.consume(Data(line.utf8)) }
         return parser.result
     }
-    private struct Parser {
+    fileprivate struct Parser {
         private static let markers = ["\"session_meta\"", "\"turn_context\"", "\"token_count\"", "\"token_usage_record\""].map { Data($0.utf8) }
         private let fractionalDate: ISO8601DateFormatter = {
             let f = ISO8601DateFormatter(); f.formatOptions.insert(.withFractionalSeconds); return f

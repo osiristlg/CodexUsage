@@ -37,7 +37,7 @@ if CommandLine.arguments.contains("--profile-local") {
         let result = try await scanner.scan(folder: LogScanner.defaultFolder, start: start, end: end)
         let elapsed = began.duration(to: clock.now)
         let total = result.points.reduce(Int64(0)) { $0 + $1.tokens.total }
-        print("PROFILE \(label): \(elapsed), \(result.files) files, \(result.filesParsed) parsed, \(result.bytesRead) bytes read, \(result.points.count) points, \(total) tokens, \(result.unreadableFiles) unreadable, \(result.malformedRecords) malformed")
+        print("PROFILE \(label): \(elapsed), \(result.files) files, \(result.filesParsed) parsed (\(result.filesResumed) tails), \(result.bytesRead) bytes read, \(result.points.count) points, \(total) tokens, \(result.unreadableFiles) unreadable, \(result.malformedRecords) malformed")
     }
 }
 if CommandLine.arguments.contains("--keychain") {

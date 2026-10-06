@@ -111,7 +111,7 @@ enum UsageSource: Hashable { case local, all, machine(String) }
             localAggregates = derived
             points = scan.points
             filesScanned = scan.files
-            scanDiagnostics = "Scan: \(elapsed). Parsed \(scan.filesParsed) of \(scan.files) files; read \(ByteCountFormatter.string(fromByteCount: scan.bytesRead, countStyle: .file))."
+            scanDiagnostics = "Scan: \(elapsed). Parsed \(scan.filesParsed) of \(scan.files) files (\(scan.filesResumed) tails); read \(ByteCountFormatter.string(fromByteCount: scan.bytesRead, countStyle: .file))."
             try LocalStore.save(points, name: "mac-history.json")
             lastRefresh = now
             status = "\(scan.files) sessions · \(scan.points.count) responses"

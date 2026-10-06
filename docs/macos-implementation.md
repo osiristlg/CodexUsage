@@ -72,6 +72,16 @@ These are scanner measurements, not complete refresh times; aggregation, saving 
 
 CPU sampling first showed roughly 81% of the sampled scanner thread in Unicode substring searches. Byte filtering removed that cost. A second sample then showed roughly 92% in the generic `Data.firstIndex` newline search. Bounded `memchr` replaces per-byte storage access. Timestamp formatters are reused within each file, and per-chunk autorelease pools release temporary Foundation objects during background parsing.
 
-An actor owns the in-memory file cache. Cache entries contain file identity, size, modification/creation times, calendar range and derived usage only. Changed files are reparsed in full; no append-only assumption is made. Files changed during parsing are not cached. Deleted files are removed, unreadable files block publishing replacement totals, and explicit rebuilds discard cached entries. Regression checks cover append, partial final lines, token-format precedence, replacement, truncation, deletion, day rollover, forced rebuild, CRLF and read-buffer boundaries.
+An actor owns the in-memory file cache. The initial implementation cached unchanged files and fully reparsed changed files. Deleted files are removed, unreadable files block publishing replacement totals, and explicit rebuilds discard cached entries. Regression checks cover append, partial final lines, token-format precedence, replacement, truncation, deletion, day rollover, forced rebuild, CRLF and read-buffer boundaries.
 
 The project panel now contains a scrollable list within the shared chart height, preserving the dashboard's 19-point gaps as project counts increase.
+
+## Append-tail disk I/O — October 6, 2026
+
+The Mac already skipped unchanged session files. A live baseline of 502 files (1.49 GB) nevertheless reread 36,616,518 bytes when one session grew. Tail processing now preserves per-file model/effort/project context, both derived usage formats and the last complete-line offset. Format preference is still evaluated per file for the requested range. Unterminated trailing lines are reread from their start; oversized incomplete lines retain only discard state. No raw log bodies are retained. Two bounded 4 KB checkpoints per file validate the prefix and prior EOF before resuming; those bytes are included in diagnostics.
+
+A release benchmark on 503 live files measured a 6.51-second cold scan, followed by a 0.155-second refresh reading 41,027 bytes across two appended tails, then a 0.073-second unchanged refresh reading zero log bytes. These are scanner timings, excluding aggregation, storage and network exchange. The live corpus grew during the runs.
+
+Reads stop at the initial file-size snapshot. Appends after that boundary are picked up on the next refresh, allowing continuously growing sessions to retain cached state. Truncation, inode/creation-time changes, same-size modification, changed checkpoints, new calendar bounds and explicit rebuilds cause full parsing. Boundary checks assume ordinary append-only growth: an in-place edit in an unchecked middle region combined with growth can evade them. A full rebuild remains the repair path for manually rewritten logs. The cache is process-local; launch and day rollover still read the collection once.
+
+Debug and release checks compare tail results with independent full-file scans, verify retained context and format preference, and require fewer than 20 KB read for an append to a synthetic 13 MB session. Windows sources and receiver behavior were not changed.
